@@ -79,7 +79,8 @@ function dijkstra_risk_prune(graph::LandmarkGraph, max_risk::Float64)
 
             new_risk = 1.0 - (1.0 - cumulative_risk[current_node]) * (1.0 - edge_risk)
             new_dist = dist[current_node] + edge_distance
-            new_uncertainty = sqrt(cumulative_uncertainty[current_node]^2 + graph.landmarks[neighbor].σ^2)
+            # Make the new uncertainty update to improve with an expected value based on risk
+            new_uncertainty = sqrt(cumulative_uncertainty[current_node]^2 + (1.0 - edge_risk)*graph.landmarks[neighbor].σ^2)
 
             # Only consider neighbor if risk is below threshold
             if new_risk <= max_risk && new_dist < dist[neighbor]
