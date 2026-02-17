@@ -47,14 +47,16 @@ function calc_edge_risk(current_σ::Float64, lj_σ::Float64, add_σ::Float64)
     return risk
 end
 
-function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
-                                  max_risk::Float64)
+@enum Objective MinDistance MinRisk
+
+function dijkstra_rcsp(graph::LandmarkGraph,
+                       threshold::Float64,
+                       objective::Objective)
 
     n = graph.n
 
     states = State[]
     node_states = [Int[] for _ in 1:n]
-
     pq = PriorityQueue{Int, Float64}()
 
     start = State(1, 0.0, 0.0,
@@ -62,10 +64,13 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
 
     push!(states, start)
     push!(node_states[1], 1)
-    enqueue!(pq, 1, 0.0)
+
+    # Priority = objective value
+    start_priority = objective == MinDistance ? 0.0 : 0.0
+    enqueue!(pq, 1, start_priority)
 
     goal_state = 0
-    best_goal_dist = Inf
+    best_goal_value = Inf
 
     while !isempty(pq)
 
@@ -77,20 +82,24 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
         r   = S.risk
         unc = S.unc
 
-        # Skip dominated states still in queue
         if !(si in node_states[v])
             continue
         end
 
-        # Goal handling (do NOT break yet)
+        # ---------- GOAL HANDLING ----------
         if v == n
-            if d < best_goal_dist
-                best_goal_dist = d
+
+            value = objective == MinDistance ? d : r
+
+            if value < best_goal_value
+                best_goal_value = value
                 goal_state = si
             end
+
             continue
         end
 
+        # ---------- EXPANSION ----------
         for u in 1:n
 
             if u == v
@@ -111,12 +120,18 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
             )
 
             new_risk = 1.0 - (1.0 - r) * (1.0 - edge_risk)
-
-            if new_risk > max_risk
-                continue
-            end
-
             new_dist = d + edge_distance
+
+            # ---------- CONSTRAINT PRUNING ----------
+            if objective == MinDistance
+                if new_risk > threshold
+                    continue
+                end
+            else
+                if new_dist > threshold
+                    continue
+                end
+            end
 
             new_unc = sqrt(
                 unc^2 +
@@ -124,6 +139,7 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
                 graph.landmarks[u].σ^2
             )
 
+            # ---------- DOMINANCE CHECK ----------
             dominated = false
             to_remove = Int[]
 
@@ -162,11 +178,16 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
             new_si = length(states)
 
             push!(node_states[u], new_si)
-            enqueue!(pq, new_si, new_dist)
+
+            # ---------- PRIORITY ----------
+            priority = objective == MinDistance ?
+                       new_dist : new_risk
+
+            enqueue!(pq, new_si, priority)
         end
 
-        # Safe termination condition
-        if !isempty(pq) && peek(pq)[2] >= best_goal_dist
+        # ---------- SAFE TERMINATION ----------
+        if !isempty(pq) && peek(pq)[2] >= best_goal_value
             break
         end
     end
@@ -175,6 +196,7 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
         return "Impossible", Inf, NaN
     end
 
+    # ---------- PATH RECONSTRUCTION ----------
     path = Int[]
     si = goal_state
 
@@ -191,25 +213,26 @@ function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
 end
 
 # Create start, 16 landmarks, end
+# uncertainties (σ) hardcoded between 0.02 and 0.5
 landmarks = [
     Landmark(0.1, 0.1, 0.1),
-    Landmark(2.3,  7.1, 0.1),
-    Landmark(5.8,  1.4, 0.1),
-    Landmark(9.2,  3.7, 0.1),
-    Landmark(1.1,  8.9, 0.1),
-    Landmark(6.4,  2.2, 0.1),
-    Landmark(3.9,  5.6, 0.1),
-    Landmark(7.7,  0.8, 0.1),
-    Landmark(4.5,  9.3, 0.1),
-    Landmark(8.8,  6.1, 0.1),
-    Landmark(0.6,  4.4, 0.1),
-    Landmark(10.2, 1.9, 0.1),
-    Landmark(12.5, 7.8, 0.1),
-    Landmark(14.1, 3.3, 0.1),
-    Landmark(11.7, 9.0, 0.1),
-    Landmark(13.4, 2.7, 0.1),
-    Landmark(14.3, 5.2, 0.1),
-    Landmark(14.9, 14.9, 0.0)
+    Landmark(2.3,  7.1, 0.47),
+    Landmark(5.8,  1.4, 0.21),
+    Landmark(9.2,  3.7, 0.33),
+    Landmark(1.1,  8.9, 0.05),
+    Landmark(6.4,  2.2, 0.50),
+    Landmark(3.9,  5.6, 0.12),
+    Landmark(7.7,  0.8, 0.38),
+    Landmark(4.5,  9.3, 0.29),
+    Landmark(8.8,  6.1, 0.08),
+    Landmark(0.6,  4.4, 0.19),
+    Landmark(10.2, 1.9, 0.41),
+    Landmark(12.5, 7.8, 0.22),
+    Landmark(14.1, 3.3, 0.49),
+    Landmark(11.7, 9.0, 0.31),
+    Landmark(13.4, 2.7, 0.07),
+    Landmark(14.3, 5.2, 0.25),
+    Landmark(14.9, 14.9, 0.0)   # goal zero uncertainty
 ]
 
 graph = generate_graph(landmarks)
@@ -218,7 +241,8 @@ x_coords = [lm.x for lm in graph.landmarks]
 y_coords = [lm.y for lm in graph.landmarks]
 marker_sizes = [lm.σ * MARKER_PROPORTION for lm in graph.landmarks]  # scale factor to make it visible
 
-scatter(x_coords[2:end-1], y_coords[2:end-1], label="Landmarks", color=:red, markersize=marker_sizes[2:end-1])
+scatter(x_coords[2:end-1], y_coords[2:end-1], label="Landmarks", color=:red, markersize=marker_sizes[2:end-1], markerstrokewidth = 0)
+scatter!(x_coords[2:end-1], y_coords[2:end-1], label=false, color=:black, markersize=1)
 scatter!([x_coords[1]], [y_coords[1]], label="Start", color=:green, markersize=marker_sizes[1])
 scatter!([x_coords[end]], [y_coords[end]], label="Goal", marker=:star5, color=:orange, markersize=7)
 
@@ -226,8 +250,8 @@ scatter!([x_coords[end]], [y_coords[end]], label="Goal", marker=:star5, color=:o
 current_σ = graph.landmarks[1].σ
 current_ind = 1
 
-# Run Dijkstra
-path, total_distance, total_risk = dijkstra_risk_prune_rcsp(graph, 0.004)
+# Run Dijkstra RCSP on MinDistance
+path, total_distance, total_risk = dijkstra_rcsp(graph, 0.1, MinDistance)
 
 println("Shortest path indices: ", path)
 println("Total distance: ", total_distance)
@@ -240,5 +264,31 @@ if path != "Impossible"
 
     # Draw the path on top of the scatter plot
     plot!(path_x, path_y, label="Shortest Path", color=:blue, linewidth=2)
-    savefig("myplot_with_path.png")
+    savefig("min_dist.png")
+end
+
+scatter(x_coords[2:end-1], y_coords[2:end-1], label="Landmarks", color=:red, markersize=marker_sizes[2:end-1], markerstrokewidth = 0)
+scatter!(x_coords[2:end-1], y_coords[2:end-1], label=false, color=:black, markersize=1)
+scatter!([x_coords[1]], [y_coords[1]], label="Start", color=:green, markersize=marker_sizes[1])
+scatter!([x_coords[end]], [y_coords[end]], label="Goal", marker=:star5, color=:orange, markersize=7)
+
+# Dijkstra's
+current_σ = graph.landmarks[1].σ
+current_ind = 1
+
+# Run Dijkstra RCSP on MinRisk
+path, total_distance, total_risk = dijkstra_rcsp(graph, 28.0, MinRisk)
+
+println("Shortest path indices: ", path)
+println("Total distance: ", total_distance)
+println("Total risk: ", total_risk)
+
+if path != "Impossible"
+    # Extract coordinates along the path
+    path_x = [graph.landmarks[i].x for i in path]
+    path_y = [graph.landmarks[i].y for i in path]
+
+    # Draw the path on top of the scatter plot
+    plot!(path_x, path_y, label="Lowest Risk Path", color=:blue, linewidth=2)
+    savefig("min_risk.png")
 end
