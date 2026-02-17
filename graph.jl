@@ -1,14 +1,23 @@
 using Distributions
 using Plots
+using DataStructures
 
 const VISIBILITY_RAD = 20.0
 const UNCERTAINTY_PER_METER = 1.0
 const MARKER_PROPORTION = 50.0
 
+struct State
+    node::Int
+    dist::Float64
+    risk::Float64
+    unc::Float64
+    parent::Int   # index of parent state
+end
+
 struct Landmark
     x::Float64
     y::Float64
-    σ::Float64 # uncertainty
+    σ::Float64
 end
 
 struct LandmarkGraph
@@ -38,75 +47,147 @@ function calc_edge_risk(current_σ::Float64, lj_σ::Float64, add_σ::Float64)
     return risk
 end
 
-function dijkstra_risk_prune(graph::LandmarkGraph, max_risk::Float64)
+function dijkstra_risk_prune_rcsp(graph::LandmarkGraph,
+                                  max_risk::Float64)
+
     n = graph.n
 
-    # Track shortest distance to each node
-    dist = fill(Inf, n)
-    dist[1] = 0.0
+    states = State[]
+    node_states = [Int[] for _ in 1:n]
 
-    # Track previous node to reconstruct path
-    prev = fill(-1, n)
+    pq = PriorityQueue{Int, Float64}()
 
-    # Track cumulative risk along the path
-    cumulative_risk = zeros(n)
-    cumulative_uncertainty = zeros(n)
+    start = State(1, 0.0, 0.0,
+                  graph.landmarks[1].σ, -1)
 
-    # Unvisited nodes
-    unvisited = Set(1:n)
+    push!(states, start)
+    push!(node_states[1], 1)
+    enqueue!(pq, 1, 0.0)
 
-    while !isempty(unvisited)
-        # Pick unvisited node with minimum distance
-        current_node = findmin([dist[i] for i in unvisited])[2]
-        current_node = collect(unvisited)[current_node]
+    goal_state = 0
+    best_goal_dist = Inf
 
-        # Stop if goal reached
-        if current_node == n
+    while !isempty(pq)
+
+        si = dequeue!(pq)
+        S = states[si]
+
+        v   = S.node
+        d   = S.dist
+        r   = S.risk
+        unc = S.unc
+
+        # Skip dominated states still in queue
+        if !(si in node_states[v])
+            continue
+        end
+
+        # Goal handling (do NOT break yet)
+        if v == n
+            if d < best_goal_dist
+                best_goal_dist = d
+                goal_state = si
+            end
+            continue
+        end
+
+        for u in 1:n
+
+            if u == v
+                continue
+            end
+
+            edge_distance = graph.distance[v, u]
+            if !isfinite(edge_distance)
+                continue
+            end
+
+            edge_add_unc = graph.additional_uncertainty[v, u]
+
+            edge_risk = calc_edge_risk(
+                unc,
+                graph.landmarks[u].σ,
+                edge_add_unc
+            )
+
+            new_risk = 1.0 - (1.0 - r) * (1.0 - edge_risk)
+
+            if new_risk > max_risk
+                continue
+            end
+
+            new_dist = d + edge_distance
+
+            new_unc = sqrt(
+                unc^2 +
+                (1.0 - edge_risk) *
+                graph.landmarks[u].σ^2
+            )
+
+            dominated = false
+            to_remove = Int[]
+
+            for old_si in node_states[u]
+                old = states[old_si]
+
+                if old.dist ≤ new_dist &&
+                   old.risk ≤ new_risk &&
+                   old.unc  ≤ new_unc
+                    dominated = true
+                    break
+                end
+
+                if new_dist ≤ old.dist &&
+                   new_risk ≤ old.risk &&
+                   new_unc  ≤ old.unc
+                    push!(to_remove, old_si)
+                end
+            end
+
+            if dominated
+                continue
+            end
+
+            for rem in to_remove
+                deleteat!(node_states[u],
+                          findfirst(==(rem),
+                                    node_states[u]))
+            end
+
+            push!(states,
+                  State(u, new_dist,
+                        new_risk,
+                        new_unc, si))
+
+            new_si = length(states)
+
+            push!(node_states[u], new_si)
+            enqueue!(pq, new_si, new_dist)
+        end
+
+        # Safe termination condition
+        if !isempty(pq) && peek(pq)[2] >= best_goal_dist
             break
         end
-
-        delete!(unvisited, current_node)
-
-        # Examine neighbors
-        for neighbor in unvisited
-            edge_distance = graph.distance[current_node, neighbor]
-            edge_add_unc = graph.additional_uncertainty[current_node, neighbor]
-
-            # Compute risk of this edge
-            edge_risk = calc_edge_risk(cumulative_uncertainty[current_node],
-                                       graph.landmarks[neighbor].σ,
-                                       edge_add_unc)
-
-            new_risk = 1.0 - (1.0 - cumulative_risk[current_node]) * (1.0 - edge_risk)
-            new_dist = dist[current_node] + edge_distance
-            # Make the new uncertainty update to improve with an expected value based on risk
-            new_uncertainty = sqrt(cumulative_uncertainty[current_node]^2 + (1.0 - edge_risk)*graph.landmarks[neighbor].σ^2)
-
-            # Only consider neighbor if risk is below threshold
-            if new_risk <= max_risk && new_dist < dist[neighbor]
-                dist[neighbor] = new_dist
-                prev[neighbor] = current_node
-                cumulative_risk[neighbor] = new_risk
-                cumulative_uncertainty[neighbor] = new_uncertainty
-            end
-        end
     end
 
-    # Reconstruct path
+    if goal_state == 0
+        return "Impossible", Inf, NaN
+    end
+
     path = Int[]
-    u = n
-    while u != -1
-        push!(path, u)
-        u = prev[u]
-    end
-    path = reverse(path)
+    si = goal_state
 
-    # If the first element is not start, path is impossible
-    if isempty(path) || path[1] != 1
-        return "Impossible", Inf, cumulative_risk[end]
-    else
-        return path, dist[n], cumulative_risk[end]
+    while si != -1
+        push!(path, states[si].node)
+        si = states[si].parent
     end
+
+    reverse!(path)
+
+    final = states[goal_state]
+
+    return path, final.dist, final.risk
 end
 
 # Create start, 16 landmarks, end
@@ -146,7 +227,7 @@ current_σ = graph.landmarks[1].σ
 current_ind = 1
 
 # Run Dijkstra
-path, total_distance, total_risk = dijkstra_risk_prune(graph, 0.001)
+path, total_distance, total_risk = dijkstra_risk_prune_rcsp(graph, 0.004)
 
 println("Shortest path indices: ", path)
 println("Total distance: ", total_distance)
