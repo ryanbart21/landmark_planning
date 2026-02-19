@@ -4,8 +4,11 @@ using DataStructures
 using LinearAlgebra
 
 const VISIBILITY_RAD = 5.0
-const UNCERTAINTY_PER_METER = 1.0
+const DIR_UNCERTAINTY_PER_METER = 1.0
+const PERP_UNCERTAINTY_PER_METER = 0.3
 const MARKER_PROPORTION = 50.0
+const NUM_AGENTS = 3
+const SENSOR_NOISE = 0.5
 
 struct State
     node::Int
@@ -25,51 +28,54 @@ struct LandmarkGraph
     n::Int
     landmarks::Vector{Landmark}
     distance::Matrix{Float64}
-    additional_uncertainty::Matrix{Float64}    # scalar extra uncertainty per edge
+    orientation::Matrix{Float64}              # direction angle from i to j
 end
 
 function generate_graph(landmarks::Vector{Landmark})
     n = length(landmarks)
     dist = zeros(n,n)
-    add_unc = zeros(n,n)
+    orient = zeros(n,n)
     for (i, li) in enumerate(landmarks)
         for (j, lj) in enumerate(landmarks)
-            dist[i,j] = sqrt((li.x-lj.x)^2 + (li.y-lj.y)^2)
-            # scalar uncertainty added due to distance
-            add_unc[i,j] = UNCERTAINTY_PER_METER * dist[i,j]
+            len_x = lj.x - li.x        # direction i->j
+            len_y = lj.y - li.y
+            dist[i,j] = sqrt((len_x)^2 + (len_y)^2)
+            orient[i,j] = atan(len_y, len_x)  # two-argument atan serves as atan2 in Julia
         end
     end
-    return LandmarkGraph(n, landmarks, dist, add_unc)
+    return LandmarkGraph(n, landmarks, dist, orient)
 end
 
-# return the largest eigenvalue of a symmetric 2×2 matrix
+# return the largest eigenvalue of a (real) symmetric 2×2 matrix
 function max_eigenvalue(cov::Matrix{Float64})
-    vals = eigvals(cov)
-    return maximum(vals)
+    # ensure symmetry and real values
+    cov_sym = Symmetric((cov + cov')/2)
+    vals = eigvals(cov_sym)
+    return maximum(real(vals))
 end
 
-# Compute probability of a 2D Gaussian being within a circle of radius R
-function twoD_prob_within_radius(cov::Matrix{Float64}, R::Float64; n_samples=100_000)
-    mvn = MvNormal([0.0, 0.0], cov)
-    samples = rand(mvn, n_samples)  # 2 × n_samples
-    dists = sqrt.(sum(samples.^2, dims=1))  # Euclidean distances
-    mean(dists .<= R)  # fraction within circle
+# rotate a covariance matrix by angle
+function rotate_cov(cov::Matrix{Float64}, angle::Float64)
+    R = [cos(angle) -sin(angle); sin(angle) cos(angle)]
+    return R * cov * R'
 end
 
-# Predict edge risk using convolved covariance + isotropic growth
-function calc_edge_risk(current_cov::Matrix{Float64}, lj_cov::Matrix{Float64}, edge_distance::Float64)
-    # isotropic growth due to distance
-    growth_cov = UNCERTAINTY_PER_METER * edge_distance * I(2)
+# Construct anisotropic growth covariance along direction angle
+function growth_covariance(distance::Float64, angle::Float64)
+    # diagonal in edge frame: major=DIR, minor=PERP
+    σ_dir = DIR_UNCERTAINTY_PER_METER * distance
+    σ_perp = PERP_UNCERTAINTY_PER_METER * distance
+    R = [cos(angle) -sin(angle); sin(angle) cos(angle)]
+    return R * Diagonal([σ_dir, σ_perp]) * R'
+end
 
-    # convolve current covariance + landmark covariance + growth
-    predicted_cov = current_cov + lj_cov + growth_cov
-
-    # probability inside visibility radius
-    prob_within = twoD_prob_within_radius(predicted_cov, VISIBILITY_RAD)
-
-    # risk = probability of being outside visibility radius
-    risk = 1.0 - prob_within
-
+# Predict edge risk using convolved covariance + directional growth
+function calc_edge_risk(current_cov::Matrix{Float64}, lj_cov::Matrix{Float64}, edge_distance::Float64, dir_angle::Float64)
+    growth_cov = growth_covariance(edge_distance, dir_angle)
+    # account for multiple agents by scaling new contributions
+    predicted_cov = current_cov + growth_cov + lj_cov
+    σ = sqrt(max_eigenvalue(predicted_cov))
+    risk = exp(-VISIBILITY_RAD^2 / (2σ^2))
     return risk, predicted_cov
 end
 
@@ -77,7 +83,8 @@ end
 
 function dijkstra_rcsp(graph::LandmarkGraph,
                        threshold::Float64,
-                       objective::Objective)
+                       objective::Objective,
+                       num_ag::Int = 1)
 
     n = graph.n
 
@@ -128,12 +135,12 @@ function dijkstra_rcsp(graph::LandmarkGraph,
                 continue
             end
 
-            edge_add_unc = graph.additional_uncertainty[v, u]
-
+            angle = graph.orientation[v,u]
             edge_risk, combined_cov = calc_edge_risk(
                 cov,
                 graph.landmarks[u].cov,
-                edge_add_unc
+                edge_distance,
+                angle
             )
 
             new_risk = 1.0 - (1.0 - r) * (1.0 - edge_risk)
@@ -150,8 +157,31 @@ function dijkstra_rcsp(graph::LandmarkGraph,
                 end
             end
 
-            # update covariance after traversing edge
-            new_cov = cov + (1.0 - edge_risk) * graph.landmarks[u].cov
+            P_pred = combined_cov
+
+            θ = angle
+            H = [cos(θ) sin(θ)]          # 1×2
+
+            # Measurement noise (sensor) as scalar
+            R_sensor = SENSOR_NOISE^2
+
+            # Landmark uncertainty projected along line of sight
+            P_L = graph.landmarks[u].cov
+
+            # Wrap R_eff as a 1×1 matrix to avoid scalar/matrix addition issues
+            R_eff = R_sensor + (H * P_L * H')[1]
+            
+            # Probability of successful observation
+            p = 1.0 - edge_risk
+
+            # Multi-agent information fusion
+            Λ = inv(P_pred)                    # start with predicted covariance
+            for agent_id in 1:num_ag
+                Λ += p * (H' * inv(R_eff) * H)  # contribution of each agent
+            end
+
+            # Updated covariance after multi-agent fusion
+            new_cov = inv(Λ)
 
             # dominance check using largest eigenvalue
             dominated = false
@@ -267,8 +297,8 @@ end
 scatter!(plt, [x_coords[1]], [y_coords[1]], label="Start", color=:green, markersize=marker_sizes[1])
 scatter!(plt, [x_coords[end]], [y_coords[end]], label="Goal", marker=:star5, color=:orange, markersize=7)
 
-# Run a single Dijkstra RCSP (min-distance example)
-path, total_distance, total_risk = dijkstra_rcsp(graph, 0.5, MinDistance)
+# Run a Dijkstra RCSP for all agents (min-distance)
+path, total_distance, total_risk = dijkstra_rcsp(graph, 0.5, MinDistance, NUM_AGENTS)
 
 println("Shortest path indices: ", path)
 println("Total distance: ", total_distance)
@@ -281,30 +311,4 @@ if path != "Impossible"
 
     plot!(path_x, path_y, label="Shortest Path", color=:blue, linewidth=2)
     savefig("min_dist.png")
-end
-
-plt = scatter(x_coords[2:end-1], y_coords[2:end-1], label=false, color=:black, markersize=1)
-# draw covariance ellipses for landmarks
-for i in 2:length(landmarks)-1
-    draw_covariance_ellipse!(plt, landmarks[i].x, landmarks[i].y, landmarks[i].cov,
-                             color=:red, alpha=0.3)
-end
-scatter!(plt, [x_coords[1]], [y_coords[1]], label="Start", color=:green, markersize=marker_sizes[1])
-scatter!(plt, [x_coords[end]], [y_coords[end]], label="Goal", marker=:star5, color=:orange, markersize=7)
-
-# Run a single Dijkstra RCSP (min-distance example)
-path, total_distance, total_risk = dijkstra_rcsp(graph, 30.0, MinRisk)
-
-println("Shortest path indices: ", path)
-println("Total distance: ", total_distance)
-println("Total risk: ", total_risk)
-
-if path != "Impossible"
-    # Extract coordinates along the path
-    path_x = [graph.landmarks[i].x for i in path]
-    path_y = [graph.landmarks[i].y for i in path]
-
-    # Draw the path on top of the scatter plot
-    plot!(path_x, path_y, label="Lowest Risk Path", color=:blue, linewidth=2)
-    savefig("min_risk.png")
 end
