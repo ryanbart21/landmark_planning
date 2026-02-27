@@ -6,6 +6,8 @@ using LinearAlgebra
 # ----------------------
 # Constants & Parameters
 # ----------------------
+risk_threshold = 0.24
+
 const VISIBILITY_RAD = 5.0
 const DIR_UNCERTAINTY_PER_METER = 0.3
 const MAJ_MIN_UNC_RATIO = 3
@@ -13,7 +15,7 @@ const PERP_UNCERTAINTY_PER_METER = DIR_UNCERTAINTY_PER_METER / MAJ_MIN_UNC_RATIO
 const MARKER_PROPORTION = 50.0
 const NUM_AGENTS = 3
 const SENSOR_NOISE = 0.5
-const COMM_RADIUS   = 5.0   # communication radius; weight tapers as Gaussian
+const COMM_RADIUS   = 10.0   # communication radius; weight tapers as Gaussian
 
 # ----------------------
 # Data Structures
@@ -89,6 +91,47 @@ end
 function fuse_cov(path_cov::Matrix{Float64}, landmark_cov::Matrix{Float64})
     R_s = SENSOR_NOISE^2 * I(2)
     return inv(inv(path_cov) + inv(landmark_cov + R_s))
+end
+
+# ---------------------------------------------------------------------------
+# Shortest-path search (no risk constraint) — pure Dijkstra.
+# Returns the minimum-distance path from node 1 to node n regardless of risk.
+# Used to initialise the provisional path so support agents plan around the
+# ideal direct route rather than an already-cautious risk-constrained detour.
+# ---------------------------------------------------------------------------
+function search_shortest_path(graph::LandmarkGraph)
+    n      = graph.n
+    dist   = fill(Inf, n)
+    parent = fill(-1,  n)
+    dist[1] = 0.0
+    pq = PriorityQueue{Int, Float64}()
+    enqueue!(pq, 1, 0.0)
+
+    while !isempty(pq)
+        v = dequeue!(pq)
+        for u in 1:n
+            u == v && continue
+            d = graph.distance[v, u]
+            isfinite(d) || continue
+            nd = dist[v] + d
+            if nd < dist[u]
+                dist[u]   = nd
+                parent[u] = v
+                pq[u]     = nd   # insert or decrease-key
+            end
+        end
+    end
+
+    isinf(dist[n]) && return Int[], Inf
+
+    path = Int[]
+    v = n
+    while v != -1
+        push!(path, v)
+        v = parent[v]
+    end
+    reverse!(path)
+    return path, dist[n]
 end
 
 # ---------------------------------------------------------------------------
@@ -206,12 +249,21 @@ end
 # ---------------------------------------------------------------------------
 # Support-agent search
 #
-# Travels up to dist_cap and maximises sum of avg_eigenvalue(global_cov[node])
-# for nodes on primary_path.  Because global_cov is updated after each agent,
-# agent k+1 sees residual uncertainty and naturally takes a different route.
+# Objective: maximise uncertainty reduction for the primary agent, accounting
+# for BOTH spatial proximity (comm radius) AND temporal ordering.
 #
-# No risk constraint — Pareto dominance is on (dist, benefit) only so diverse
-# paths are not pruned away.
+# Timing model: all agents travel at the same speed, so time ∝ distance.
+# A support-agent observation at node u (reached at distance d_sup) can be
+# communicated to the primary agent before it reaches primary-path node k
+# (reached at d_prim[k]) iff d_sup <= d_prim[k].  This is a hard gate —
+# being early is always fine; there is no penalty for large time slack.
+# The observation does NOT need to be at or near the primary path — it just
+# needs to be spatially informative about node k (captured by the spatial
+# Gaussian exp(-dist(u,k)^2/2σ^2)) and transmitted in time.
+#
+# Benefit is a rollout (not a heuristic): the actual drop in avg_eigenvalue
+# from fusing with the visited landmark, summed over all primary-path nodes
+# the observation can still reach in time.
 # ---------------------------------------------------------------------------
 function search_support_agent!(graph::LandmarkGraph,
                                 global_cov::Vector{Matrix{Float64}},
@@ -220,26 +272,41 @@ function search_support_agent!(graph::LandmarkGraph,
                                 use_heuristic::Bool = false)
     n = graph.n
 
-    # Pre-compute communication weight for each node u relative to the primary
-    # path.  The weight is the maximum Gaussian taper over all primary-path
-    # nodes: w(u) = max_j exp(-d(u,j)^2 / (2*COMM_RADIUS^2)).
-    # This means a support agent at u can communicate well with the primary
-    # agent at any nearby primary-path node, and benefit tapers smoothly to
-    # zero beyond COMM_RADIUS.  Nodes on the primary path itself score w=1.
-    comm_weight = zeros(n)
-    for u in 1:n
-        for pnode in primary_path
-            d_comm = graph.distance[u, pnode]
-            w = exp(-d_comm^2 / (2 * COMM_RADIUS^2))
-            comm_weight[u] = max(comm_weight[u], w)
+    # Pre-compute cumulative distance of the primary agent along its path.
+    # d_prim[k] = distance the primary agent has traveled when it reaches
+    # primary_path[k].  Index into this vector by primary-path position.
+    np = length(primary_path)
+    d_prim = zeros(np)
+    for k in 2:np
+        d_prim[k] = d_prim[k-1] + graph.distance[primary_path[k-1], primary_path[k]]
+    end
+
+    # joint_weight(u, d_sup):
+    #   A support agent at node u, having traveled d_sup, can communicate an
+    #   observation of u to the primary agent before it reaches primary-path
+    #   node k iff d_sup <= d_prim[k] (hard temporal gate — being early is
+    #   always fine, being late means the primary has already passed).
+    #   The spatial weight exp(-dist(u,k)^2 / 2σ^2) captures how informative
+    #   an observation at u is about the uncertainty at primary-path node k
+    #   (nearby landmarks are more correlated).
+    #   We sum over all primary-path nodes k that can still be helped, so the
+    #   support agent gets credit for reducing uncertainty at multiple nodes.
+    function joint_weight(u::Int, d_sup::Float64)
+        w_total = 0.0
+        for k in 1:np
+            d_sup > d_prim[k] && continue   # too late — primary already passed k
+            d_spatial = graph.distance[u, primary_path[k]]
+            w_spatial = exp(-d_spatial^2 / (2 * COMM_RADIUS^2))
+            w_total += w_spatial
         end
+        return w_total
     end
 
     states      = SupportState[]
     node_states = [Int[] for _ in 1:n]
     pq          = PriorityQueue{Int, Float64}()
 
-    init_benefit = comm_weight[1] * avg_eigenvalue(global_cov[1])
+    init_benefit = joint_weight(1, 0.0) * avg_eigenvalue(global_cov[1])
     push!(states, SupportState(1, 0.0, 0.0, copy(global_cov[1]), init_benefit, -1))
     push!(node_states[1], 1)
     enqueue!(pq, 1, -init_benefit)
@@ -278,17 +345,13 @@ function search_support_agent!(graph::LandmarkGraph,
             edge_risk, _ = calc_edge_risk(cov, global_cov[u], edge_dist, angle)
             new_risk = 1.0 - (1.0 - r) * (1.0 - edge_risk)
 
-            # Rollout benefit: how much does visiting u actually reduce avg uncertainty
-            # along *this specific path*, given all prior fusions?  Computed as the
-            # drop in avg_eigenvalue before vs after fusing with the landmark at u,
-            # weighted by comm_weight so only nodes near the primary path count.
-            # This is a true rollout — not a heuristic — with diminishing returns
-            # built in: a node already well-observed from prior path fusions gives
-            # near-zero benefit even if global_cov[u] is still high.
-            new_cov     = fuse_cov(cov, global_cov[u])
-            uncertainty_before = avg_eigenvalue(cov)
-            uncertainty_after  = avg_eigenvalue(new_cov)
-            new_benefit = benefit + comm_weight[u] * max(0.0, uncertainty_before - uncertainty_after)
+            # Rollout benefit weighted by joint spatio-temporal comm weight.
+            # joint_weight(u, new_dist) is nonzero only if the support agent
+            # arrives at u early enough to inform the primary agent at some
+            # nearby primary-path node.
+            new_cov = fuse_cov(cov, global_cov[u])
+            uncertainty_drop = max(0.0, avg_eigenvalue(cov) - avg_eigenvalue(new_cov))
+            new_benefit = benefit + joint_weight(u, new_dist) * uncertainty_drop
 
             # Pareto dominance on (dist, benefit) only — no risk constraint
             dominated = false
@@ -310,7 +373,6 @@ function search_support_agent!(graph::LandmarkGraph,
             push!(states, SupportState(u, new_dist, new_risk, new_cov, new_benefit, si))
             new_si = length(states)
             push!(node_states[u], new_si)
-            # Maximise benefit; tie-break by shorter distance
             enqueue!(pq, new_si, -new_benefit + 1e-9 * new_dist)
         end
     end
@@ -325,19 +387,27 @@ function search_support_agent!(graph::LandmarkGraph,
     reverse!(path)
     final = states[goal_state]
 
-    # Update global_cov so the next agent and the primary agent see residual
-    # uncertainty.  A measurement at node `node` also reduces uncertainty at
-    # spatially nearby nodes via spatial correlation, modelled as a Gaussian
-    # decay with COMM_RADIUS.  This captures cross-node benefit: the primary
-    # agent visiting a neighbour of a support-agent node gets partial credit.
-    for node in path
-        for v in 1:graph.n
-            spatial_w = exp(-graph.distance[node, v]^2 / (2 * COMM_RADIUS^2))
-            spatial_w < 1e-4 && continue   # skip negligible contributions
-            # Blend: interpolate between current global_cov[v] and the fused value
-            # proportional to spatial_w (full fusion only at the visited node itself)
-            fused = fuse_cov(global_cov[v], final.cov)
-            global_cov[v] = (1.0 - spatial_w) .* global_cov[v] .+ spatial_w .* fused
+    # Update global_cov: for each node the support agent visited, propagate
+    # its measurement to primary-path nodes that it could have informed in time
+    # (d_sup_node <= d_prim[k]) weighted by spatial proximity.
+    # Being early is always valid — only late observations are excluded.
+    sup_cum_dist = 0.0
+    sup_node_dist = Dict{Int,Float64}()
+    for idx in 1:length(path)
+        if idx > 1
+            sup_cum_dist += graph.distance[path[idx-1], path[idx]]
+        end
+        sup_node_dist[path[idx]] = sup_cum_dist
+    end
+
+    for (node, d_sup_node) in sup_node_dist
+        for k in 1:np
+            d_sup_node > d_prim[k] && continue   # observation arrived too late
+            pnode = primary_path[k]
+            spatial_w = exp(-graph.distance[node, pnode]^2 / (2 * COMM_RADIUS^2))
+            spatial_w < 1e-4 && continue
+            fused = fuse_cov(global_cov[pnode], final.cov)
+            global_cov[pnode] = (1.0 - spatial_w) .* global_cov[pnode] .+ spatial_w .* fused
         end
     end
 
@@ -345,54 +415,137 @@ function search_support_agent!(graph::LandmarkGraph,
 end
 
 # ---------------------------------------------------------------------------
-# Multi-agent RCSP orchestration
-# Phase 1: Preliminary primary search (no global_cov update) → provisional path + dist
-# Phase 2: Support agents sequentially reduce global_cov at primary-path nodes
-# Phase 3: Primary agent replans with updated global_cov, capped at provisional_dist
+# Single iteration: given a fixed provisional_path, run support agents and
+# replan the primary agent.  global_cov is reset from scratch each call so
+# iterations are independent.  Returns the primary agent's new path + all paths.
 # ---------------------------------------------------------------------------
-function multi_agent_rcsp(graph::LandmarkGraph,
-                          risk_threshold::Float64,
-                          num_ag::Int = 1)
+function run_iteration(graph::LandmarkGraph,
+                       provisional_path::Vector{Int},
+                       provisional_dist::Float64,
+                       risk_threshold::Float64,
+                       num_ag::Int)
 
-    n = graph.n
+    n          = graph.n
+    # Fresh covariances every iteration — no bleed-through between iterations
     global_cov = [copy(graph.landmarks[i].cov) for i in 1:n]
-    paths = Vector{Int}[]
-    dists = Float64[]
-    risks = Float64[]
+    sup_paths  = Vector{Int}[]
+    sup_dists  = Float64[]
+    sup_risks  = Float64[]
 
-    # Phase 1
-    provisional_path, provisional_dist, provisional_risk =
-        search_main_agent!(graph, global_cov, risk_threshold;
-                           use_heuristic=true, update_global=false)
-
-    if isempty(provisional_path)
-        println("No feasible path found in preliminary search.")
-        return paths, dists, risks, global_cov, Int[], Inf, NaN
-    end
-
-    # Phase 2
+    # Support agents plan around provisional_path, within provisional_dist
     for _ in 2:num_ag
         path, d, r = search_support_agent!(graph, global_cov,
                                             provisional_dist, provisional_path;
                                             use_heuristic=false)
-        push!(paths, path)
-        push!(dists, isempty(path) ? Inf : d)
-        push!(risks, isempty(path) ? NaN : r)
+        push!(sup_paths, path)
+        push!(sup_dists, isempty(path) ? Inf : d)
+        push!(sup_risks,  isempty(path) ? NaN : r)
     end
 
-    # Phase 3: primary agent replans on the updated global_cov (support agents
-    # have reduced uncertainty at and near provisional-path nodes).  No dist_cap
-    # here — we want the shortest path that satisfies the risk threshold, which
-    # may now be shorter than provisional_dist because previously-risky shortcuts
-    # are now feasible thanks to the support agents' covariance reductions.
+    # Primary agent replans on the support-updated global_cov
     main_path, main_d, main_r =
         search_main_agent!(graph, global_cov, risk_threshold;
                            use_heuristic=true, update_global=true)
-    push!(paths, main_path)
-    push!(dists, main_d)
-    push!(risks, main_r)
 
-    return paths, dists, risks, global_cov, provisional_path, provisional_dist, provisional_risk
+    return main_path, main_d, main_r, sup_paths, sup_dists, sup_risks
+end
+
+# ---------------------------------------------------------------------------
+# Multi-agent RCSP orchestration with iterative refinement
+#
+# Iteration 0: provisional path = shortest unconstrained path (ideal target).
+#              provisional_dist = solo risk-constrained distance (caps support travel).
+# Iteration k: provisional path = primary agent's path from iteration k-1.
+#              Repeat until path converges or max_iter reached.
+#
+# global_cov is reset at the start of each iteration so covariance reductions
+# from one iteration don't compound into the next.
+# ---------------------------------------------------------------------------
+function multi_agent_rcsp(graph::LandmarkGraph,
+                          risk_threshold::Float64,
+                          num_ag::Int = 1;
+                          max_iter::Int = 5)
+
+    n = graph.n
+
+    # --- Bootstrap: shortest path + solo risk-constrained distance ---
+    shortest_path, shortest_dist = search_shortest_path(graph)
+    if isempty(shortest_path)
+        println("No path exists in graph.")
+        return Vector{Int}[], Float64[], Float64[], [copy(graph.landmarks[i].cov) for i in 1:n],
+               Int[], Inf, NaN, 0
+    end
+
+    # Solo risk-constrained dist: how far primary would go alone (caps support travel)
+    init_cov = [copy(graph.landmarks[i].cov) for i in 1:n]
+    _, solo_dist, solo_risk =
+        search_main_agent!(graph, init_cov, risk_threshold;
+                           use_heuristic=true, update_global=false)
+
+    if isinf(solo_dist)
+        println("No feasible risk-constrained path found solo.")
+        return Vector{Int}[], Float64[], Float64[], init_cov, Int[], Inf, NaN, 0
+    end
+
+    # provisional_path is what support agents target; starts as shortest path.
+    # provisional_dist caps how far support agents roam; starts as solo dist.
+    # We only update provisional_path when the primary route genuinely changes
+    # to a *different* path — if the same path comes back with higher risk (because
+    # support agents shifted their coverage), we keep the previous best result.
+    provisional_path = shortest_path
+    provisional_dist = solo_dist
+
+    best_paths     = Vector{Int}[]
+    best_dists     = Float64[]
+    best_risks     = Float64[]
+    converged_iter = 0
+
+    for iter in 1:max_iter
+        main_path, main_d, main_r, sup_paths, sup_dists, sup_risks =
+            run_iteration(graph, provisional_path, provisional_dist,
+                          risk_threshold, num_ag)
+
+        if isempty(main_path)
+            println("  Iter $iter: primary agent found no path — stopping.")
+            break
+        end
+
+        println("  Iter $iter: primary path = ", main_path,
+                "  dist=", round(main_d, digits=3),
+                "  risk=", round(main_r, digits=4))
+
+        # Always update with this iteration's result. With provisional_dist fixed
+        # at solo_dist, support agents have the same travel budget every iteration
+        # and risk should be non-increasing. Warn if it rises (indicates a bug).
+        if !isempty(best_paths) && main_r > best_risks[end]
+            println("  Warning: risk increased from ", round(best_risks[end], digits=4),
+                    " to ", round(main_r, digits=4), " — check coverage.")
+        end
+        best_paths     = vcat(sup_paths, [main_path])
+        best_dists     = vcat(sup_dists, [main_d])
+        best_risks     = vcat(sup_risks, [main_r])
+        converged_iter = iter
+
+        # Convergence: primary path is unchanged from what support agents
+        # were targeting — no new information to exploit.
+        if main_path == provisional_path
+            println("  Converged at iteration $iter.")
+            break
+        end
+
+        # Primary path changed — update provisional so next iteration's support
+        # agents target the route the primary agent actually wants to take.
+        # provisional_dist stays fixed at solo_dist: it represents how far the
+        # primary would travel alone and is the correct permanent cap on support
+        # travel regardless of how the primary path refines. Shrinking it each
+        # iteration was restricting support agents more than iteration 1 and
+        # causing them to cover the route less well, raising risk.
+        provisional_path = main_path
+    end
+
+    return best_paths, best_dists, best_risks,
+           [copy(graph.landmarks[i].cov) for i in 1:n],   # return original cov for reference
+           shortest_path, shortest_dist, solo_risk, converged_iter
 end
 
 # ----------------------
@@ -448,13 +601,13 @@ scatter!(plt, [x_coords[end]], [y_coords[end]],  label="Goal",  marker=:star5, c
 # ----------------------
 # Run
 # ----------------------
-risk_threshold = 0.1
-paths, dists, risks, _, provisional_path, provisional_dist, provisional_risk =
-    multi_agent_rcsp(graph, risk_threshold, NUM_AGENTS)
+paths, dists, risks, _, shortest_path, shortest_dist, solo_risk, converged_iter =
+    multi_agent_rcsp(graph, risk_threshold, NUM_AGENTS; max_iter=5)
 
-println("Provisional primary path : ", provisional_path,
-        "  dist=", round(provisional_dist, digits=3),
-        "  risk=", round(provisional_risk, digits=4))
+println("Shortest path (target) : ", shortest_path,
+        "  dist=", round(shortest_dist, digits=3))
+println("Solo risk-constrained  : risk=", round(solo_risk, digits=4))
+println("Converged at iteration : ", converged_iter)
 
 println("\n--- Final Results ---")
 for (i, path) in enumerate(paths[1:end-1])
