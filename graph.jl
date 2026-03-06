@@ -2,20 +2,32 @@ using Distributions
 using Plots
 using DataStructures
 using LinearAlgebra
+using QuadGK
+using SpecialFunctions
 
 # ----------------------
 # Constants & Parameters
 # ----------------------
-risk_threshold = 0.24
+# Physical scale: 1 unit = 10m. Graph spans ~200m x 200m.
+# Platform: AUV with DVL+IMU dead reckoning, acoustic landmark fixes.
+#
+# DIR_UNCERTAINTY_PER_METER : 3% dead-reckoning drift (DVL+IMU, along-track)
+# MAJ_MIN_UNC_RATIO         : along-track drift ~3x cross-track (DVL characteristic)
+# VISIBILITY_RAD            : acoustic transponder detectable within ~30m (3 units)
+# SENSOR_NOISE              : USBL/LBL fix accuracy ~2m (0.2 units)
+# COMM_RADIUS               : acoustic modem range ~80m (8 units)
+# risk_threshold            : max acceptable cumulative risk along primary path
 
-const VISIBILITY_RAD = 5.0
-const DIR_UNCERTAINTY_PER_METER = 0.3
-const MAJ_MIN_UNC_RATIO = 3
+risk_threshold = 0.01
+
+const VISIBILITY_RAD             = 3.0
+const DIR_UNCERTAINTY_PER_METER  = 0.10  # raised: direct hop now risky, forces routing through landmarks
+const MAJ_MIN_UNC_RATIO          = 3
 const PERP_UNCERTAINTY_PER_METER = DIR_UNCERTAINTY_PER_METER / MAJ_MIN_UNC_RATIO
-const MARKER_PROPORTION = 50.0
-const NUM_AGENTS = 3
-const SENSOR_NOISE = 0.5
-const COMM_RADIUS   = 10.0   # communication radius; weight tapers as Gaussian
+const MARKER_PROPORTION          = 50.0
+const NUM_AGENTS                 = 3
+const SENSOR_NOISE               = 0.1
+const COMM_RADIUS                = 8.0   # reduced: ~40m, gives sharper spatial gradient for support routing
 
 # ----------------------
 # Data Structures
@@ -24,7 +36,7 @@ struct State
     node::Int
     dist::Float64
     risk::Float64
-    cov::Matrix{Float64}   # fused covariance accumulated along this path
+    cov::Matrix{Float64}
     parent::Int
 end
 
@@ -32,8 +44,8 @@ struct SupportState
     node::Int
     dist::Float64
     risk::Float64
-    cov::Matrix{Float64}   # fused covariance accumulated along this path
-    cum_benefit::Float64   # sum of avg_eigenvalue(global_cov[node]) for primary-path nodes visited
+    cov::Matrix{Float64}
+    cum_benefit::Float64
     parent::Int
 end
 
@@ -78,27 +90,31 @@ function growth_covariance(distance::Float64, angle::Float64)
     return R * Diagonal([σ_dir^2, σ_perp^2]) * R'
 end
 
+function prob_outside_disk(Sigma::Matrix{Float64}, r::Float64)::Float64
+    # Exact P(||e|| > r) for e ~ N(0, Sigma) via 1D radial integration in eigenbasis.
+    # Accounts for full 2D covariance shape, not just the worst-case eigenvalue.
+    vals = sort(real(eigvals(Symmetric((Sigma + Sigma') / 2))), rev=true)
+    l1 = max(vals[1], 1e-12)
+    l2 = max(vals[2], 1e-12)
+    a  = (1/l1 + 1/l2) / 4
+    b  = abs(1/l2 - 1/l1) / 4
+    radial_pdf(ρ) = ρ / sqrt(l1 * l2) * exp(-ρ^2 * a) * besseli(0, ρ^2 * b)
+    p_inside, _ = quadgk(radial_pdf, 0.0, r, rtol=1e-6)
+    return clamp(1.0 - p_inside, 0.0, 1.0)
+end
+
 function calc_edge_risk(current_cov::Matrix{Float64}, lj_cov::Matrix{Float64},
                         edge_distance::Float64, dir_angle::Float64)
     predicted_cov = current_cov + growth_covariance(edge_distance, dir_angle) + lj_cov
-    σ    = sqrt(max_eigenvalue(predicted_cov))
-    risk = exp(-VISIBILITY_RAD^2 / (2σ^2))
+    risk = prob_outside_disk(predicted_cov, VISIBILITY_RAD)
     return risk, predicted_cov
 end
 
-# Fuse current path covariance with the landmark measurement at node u.
-# Kalman-style update: new_cov = (path_cov^-1 + (P_L + R_s)^-1)^-1
 function fuse_cov(path_cov::Matrix{Float64}, landmark_cov::Matrix{Float64})
     R_s = SENSOR_NOISE^2 * I(2)
     return inv(inv(path_cov) + inv(landmark_cov + R_s))
 end
 
-# ---------------------------------------------------------------------------
-# Shortest-path search (no risk constraint) — pure Dijkstra.
-# Returns the minimum-distance path from node 1 to node n regardless of risk.
-# Used to initialise the provisional path so support agents plan around the
-# ideal direct route rather than an already-cautious risk-constrained detour.
-# ---------------------------------------------------------------------------
 function search_shortest_path(graph::LandmarkGraph)
     n      = graph.n
     dist   = fill(Inf, n)
@@ -117,7 +133,7 @@ function search_shortest_path(graph::LandmarkGraph)
             if nd < dist[u]
                 dist[u]   = nd
                 parent[u] = v
-                pq[u]     = nd   # insert or decrease-key
+                pq[u]     = nd
             end
         end
     end
@@ -134,12 +150,26 @@ function search_shortest_path(graph::LandmarkGraph)
     return path, dist[n]
 end
 
-# ---------------------------------------------------------------------------
-# Primary-agent search
-#
-# Minimises total path distance subject to cumulative risk <= threshold.
-# `dist_cap` prevents the re-plan from being longer than the provisional path.
-# ---------------------------------------------------------------------------
+function trace_path_covs(graph::LandmarkGraph,
+                          path::Vector{Int},
+                          global_cov::Vector{Matrix{Float64}})
+    isempty(path) && return Matrix{Float64}[]
+    n = graph.n
+    goal_node = path[end]
+    covs = Matrix{Float64}[]
+    current_cov = copy(global_cov[path[1]])
+    push!(covs, copy(current_cov))
+    for k in 2:length(path)
+        v = path[k-1]; u = path[k]
+        current_cov = current_cov + growth_covariance(graph.distance[v,u], graph.orientation[v,u])
+        if u != goal_node
+            current_cov = fuse_cov(current_cov, global_cov[u])
+        end
+        push!(covs, copy(current_cov))
+    end
+    return covs
+end
+
 function search_main_agent!(graph::LandmarkGraph,
                              global_cov::Vector{Matrix{Float64}},
                              threshold::Float64;
@@ -177,7 +207,6 @@ function search_main_agent!(graph::LandmarkGraph,
 
         for u in 1:n
             u == v && continue
-            # cycle check
             anc = si; cycle = false
             while anc != -1
                 states[anc].node == u && (cycle = true; break)
@@ -196,10 +225,10 @@ function search_main_agent!(graph::LandmarkGraph,
             new_risk = 1.0 - (1.0 - r) * (1.0 - edge_risk)
             new_risk > threshold && continue
 
-            # Correct sequential fusion: fuse path covariance with landmark measurement
-            new_cov = fuse_cov(cov, global_cov[u])
+            # Goal is not a landmark — do not fuse its covariance
+            new_cov = (u == n) ? cov + growth_covariance(edge_dist, angle) :
+                                  fuse_cov(cov + growth_covariance(edge_dist, angle), global_cov[u])
 
-            # Pareto dominance on (dist, risk, cov_metric)
             new_metric = avg_eigenvalue(new_cov)
             dominated  = false
             to_remove  = Int[]
@@ -238,33 +267,16 @@ function search_main_agent!(graph::LandmarkGraph,
     final = states[goal_state]
 
     if update_global
-        for node in path
-            global_cov[node] = fuse_cov(global_cov[node], final.cov)
+        path_covs = trace_path_covs(graph, path, global_cov)
+        for (k, node) in enumerate(path)
+            node == n && continue  # goal is not a landmark
+            global_cov[node] = fuse_cov(global_cov[node], path_covs[k])
         end
     end
 
     return path, final.dist, final.risk
 end
 
-# ---------------------------------------------------------------------------
-# Support-agent search
-#
-# Objective: maximise uncertainty reduction for the primary agent, accounting
-# for BOTH spatial proximity (comm radius) AND temporal ordering.
-#
-# Timing model: all agents travel at the same speed, so time ∝ distance.
-# A support-agent observation at node u (reached at distance d_sup) can be
-# communicated to the primary agent before it reaches primary-path node k
-# (reached at d_prim[k]) iff d_sup <= d_prim[k].  This is a hard gate —
-# being early is always fine; there is no penalty for large time slack.
-# The observation does NOT need to be at or near the primary path — it just
-# needs to be spatially informative about node k (captured by the spatial
-# Gaussian exp(-dist(u,k)^2/2σ^2)) and transmitted in time.
-#
-# Benefit is a rollout (not a heuristic): the actual drop in avg_eigenvalue
-# from fusing with the visited landmark, summed over all primary-path nodes
-# the observation can still reach in time.
-# ---------------------------------------------------------------------------
 function search_support_agent!(graph::LandmarkGraph,
                                 global_cov::Vector{Matrix{Float64}},
                                 dist_cap::Float64,
@@ -272,29 +284,16 @@ function search_support_agent!(graph::LandmarkGraph,
                                 use_heuristic::Bool = false)
     n = graph.n
 
-    # Pre-compute cumulative distance of the primary agent along its path.
-    # d_prim[k] = distance the primary agent has traveled when it reaches
-    # primary_path[k].  Index into this vector by primary-path position.
     np = length(primary_path)
     d_prim = zeros(np)
     for k in 2:np
         d_prim[k] = d_prim[k-1] + graph.distance[primary_path[k-1], primary_path[k]]
     end
 
-    # joint_weight(u, d_sup):
-    #   A support agent at node u, having traveled d_sup, can communicate an
-    #   observation of u to the primary agent before it reaches primary-path
-    #   node k iff d_sup <= d_prim[k] (hard temporal gate — being early is
-    #   always fine, being late means the primary has already passed).
-    #   The spatial weight exp(-dist(u,k)^2 / 2σ^2) captures how informative
-    #   an observation at u is about the uncertainty at primary-path node k
-    #   (nearby landmarks are more correlated).
-    #   We sum over all primary-path nodes k that can still be helped, so the
-    #   support agent gets credit for reducing uncertainty at multiple nodes.
     function joint_weight(u::Int, d_sup::Float64)
         w_total = 0.0
         for k in 1:np
-            d_sup > d_prim[k] && continue   # too late — primary already passed k
+            d_sup > d_prim[k] && continue
             d_spatial = graph.distance[u, primary_path[k]]
             w_spatial = exp(-d_spatial^2 / (2 * COMM_RADIUS^2))
             w_total += w_spatial
@@ -320,7 +319,6 @@ function search_support_agent!(graph::LandmarkGraph,
         v, d, r, cov, benefit = S.node, S.dist, S.risk, S.cov, S.cum_benefit
         si ∉ node_states[v] && continue
 
-        # Any node within the cap (not start) is a valid terminal
         if d > 0 && d <= dist_cap && benefit > best_benefit
             best_benefit = benefit
             goal_state   = si
@@ -345,15 +343,12 @@ function search_support_agent!(graph::LandmarkGraph,
             edge_risk, _ = calc_edge_risk(cov, global_cov[u], edge_dist, angle)
             new_risk = 1.0 - (1.0 - r) * (1.0 - edge_risk)
 
-            # Rollout benefit weighted by joint spatio-temporal comm weight.
-            # joint_weight(u, new_dist) is nonzero only if the support agent
-            # arrives at u early enough to inform the primary agent at some
-            # nearby primary-path node.
-            new_cov = fuse_cov(cov, global_cov[u])
+            # Goal is not a landmark — do not fuse its covariance
+            new_cov = (u == n) ? cov + growth_covariance(edge_dist, angle) :
+                                  fuse_cov(cov + growth_covariance(edge_dist, angle), global_cov[u])
             uncertainty_drop = max(0.0, avg_eigenvalue(cov) - avg_eigenvalue(new_cov))
             new_benefit = benefit + joint_weight(u, new_dist) * uncertainty_drop
 
-            # Pareto dominance on (dist, benefit) only — no risk constraint
             dominated = false
             to_remove = Int[]
             for old_si in node_states[u]
@@ -387,10 +382,10 @@ function search_support_agent!(graph::LandmarkGraph,
     reverse!(path)
     final = states[goal_state]
 
-    # Update global_cov: for each node the support agent visited, propagate
-    # its measurement to primary-path nodes that it could have informed in time
-    # (d_sup_node <= d_prim[k]) weighted by spatial proximity.
-    # Being early is always valid — only late observations are excluded.
+    # Corrected: each visited support node communicates its landmark measurement
+    # to nearby primary-path nodes that haven't been reached yet (temporal gate).
+    # Fuse the landmark's own measurement covariance (not the agent's path cov).
+    # Distance-inflated noise: far observations are less informative.
     sup_cum_dist = 0.0
     sup_node_dist = Dict{Int,Float64}()
     for idx in 1:length(path)
@@ -401,24 +396,20 @@ function search_support_agent!(graph::LandmarkGraph,
     end
 
     for (node, d_sup_node) in sup_node_dist
+        landmark_meas_cov = graph.landmarks[node].cov + SENSOR_NOISE^2 * I(2)
         for k in 1:np
-            d_sup_node > d_prim[k] && continue   # observation arrived too late
+            d_sup_node > d_prim[k] && continue
             pnode = primary_path[k]
             spatial_w = exp(-graph.distance[node, pnode]^2 / (2 * COMM_RADIUS^2))
             spatial_w < 1e-4 && continue
-            fused = fuse_cov(global_cov[pnode], final.cov)
-            global_cov[pnode] = (1.0 - spatial_w) .* global_cov[pnode] .+ spatial_w .* fused
+            # Inflate measurement noise by proximity — distant observations less useful
+            global_cov[pnode] = fuse_cov(global_cov[pnode], landmark_meas_cov / spatial_w)
         end
     end
 
     return path, final.dist, final.risk
 end
 
-# ---------------------------------------------------------------------------
-# Single iteration: given a fixed provisional_path, run support agents and
-# replan the primary agent.  global_cov is reset from scratch each call so
-# iterations are independent.  Returns the primary agent's new path + all paths.
-# ---------------------------------------------------------------------------
 function run_iteration(graph::LandmarkGraph,
                        provisional_path::Vector{Int},
                        provisional_dist::Float64,
@@ -426,13 +417,11 @@ function run_iteration(graph::LandmarkGraph,
                        num_ag::Int)
 
     n          = graph.n
-    # Fresh covariances every iteration — no bleed-through between iterations
     global_cov = [copy(graph.landmarks[i].cov) for i in 1:n]
     sup_paths  = Vector{Int}[]
     sup_dists  = Float64[]
     sup_risks  = Float64[]
 
-    # Support agents plan around provisional_path, within provisional_dist
     for _ in 2:num_ag
         path, d, r = search_support_agent!(graph, global_cov,
                                             provisional_dist, provisional_path;
@@ -442,25 +431,13 @@ function run_iteration(graph::LandmarkGraph,
         push!(sup_risks,  isempty(path) ? NaN : r)
     end
 
-    # Primary agent replans on the support-updated global_cov
     main_path, main_d, main_r =
         search_main_agent!(graph, global_cov, risk_threshold;
                            use_heuristic=true, update_global=true)
 
-    return main_path, main_d, main_r, sup_paths, sup_dists, sup_risks
+    return main_path, main_d, main_r, sup_paths, sup_dists, sup_risks, global_cov
 end
 
-# ---------------------------------------------------------------------------
-# Multi-agent RCSP orchestration with iterative refinement
-#
-# Iteration 0: provisional path = shortest unconstrained path (ideal target).
-#              provisional_dist = solo risk-constrained distance (caps support travel).
-# Iteration k: provisional path = primary agent's path from iteration k-1.
-#              Repeat until path converges or max_iter reached.
-#
-# global_cov is reset at the start of each iteration so covariance reductions
-# from one iteration don't compound into the next.
-# ---------------------------------------------------------------------------
 function multi_agent_rcsp(graph::LandmarkGraph,
                           risk_threshold::Float64,
                           num_ag::Int = 1;
@@ -468,7 +445,6 @@ function multi_agent_rcsp(graph::LandmarkGraph,
 
     n = graph.n
 
-    # --- Bootstrap: shortest path + solo risk-constrained distance ---
     shortest_path, shortest_dist = search_shortest_path(graph)
     if isempty(shortest_path)
         println("No path exists in graph.")
@@ -476,9 +452,8 @@ function multi_agent_rcsp(graph::LandmarkGraph,
                Int[], Inf, NaN, 0
     end
 
-    # Solo risk-constrained dist: how far primary would go alone (caps support travel)
     init_cov = [copy(graph.landmarks[i].cov) for i in 1:n]
-    _, solo_dist, solo_risk =
+    solo_path, solo_dist, solo_risk =
         search_main_agent!(graph, init_cov, risk_threshold;
                            use_heuristic=true, update_global=false)
 
@@ -487,21 +462,19 @@ function multi_agent_rcsp(graph::LandmarkGraph,
         return Vector{Int}[], Float64[], Float64[], init_cov, Int[], Inf, NaN, 0
     end
 
-    # provisional_path is what support agents target; starts as shortest path.
-    # provisional_dist caps how far support agents roam; starts as solo dist.
-    # We only update provisional_path when the primary route genuinely changes
-    # to a *different* path — if the same path comes back with higher risk (because
-    # support agents shifted their coverage), we keep the previous best result.
-    provisional_path = shortest_path
+    # Initialise with the solo risk-constrained path, not the unconstrained shortest path.
+    # Support agents must cover the path the primary actually needs to take.
+    provisional_path = solo_path
     provisional_dist = solo_dist
 
-    best_paths     = Vector{Int}[]
-    best_dists     = Float64[]
-    best_risks     = Float64[]
-    converged_iter = 0
+    best_paths      = Vector{Int}[]
+    best_dists      = Float64[]
+    best_risks      = Float64[]
+    last_global_cov = [copy(graph.landmarks[i].cov) for i in 1:n]
+    converged_iter  = 0
 
     for iter in 1:max_iter
-        main_path, main_d, main_r, sup_paths, sup_dists, sup_risks =
+        main_path, main_d, main_r, sup_paths, sup_dists, sup_risks, global_cov =
             run_iteration(graph, provisional_path, provisional_dist,
                           risk_threshold, num_ag)
 
@@ -514,37 +487,26 @@ function multi_agent_rcsp(graph::LandmarkGraph,
                 "  dist=", round(main_d, digits=3),
                 "  risk=", round(main_r, digits=4))
 
-        # Always update with this iteration's result. With provisional_dist fixed
-        # at solo_dist, support agents have the same travel budget every iteration
-        # and risk should be non-increasing. Warn if it rises (indicates a bug).
         if !isempty(best_paths) && main_r > best_risks[end]
             println("  Warning: risk increased from ", round(best_risks[end], digits=4),
                     " to ", round(main_r, digits=4), " — check coverage.")
         end
-        best_paths     = vcat(sup_paths, [main_path])
-        best_dists     = vcat(sup_dists, [main_d])
-        best_risks     = vcat(sup_risks, [main_r])
-        converged_iter = iter
+        best_paths      = vcat(sup_paths, [main_path])
+        best_dists      = vcat(sup_dists, [main_d])
+        best_risks      = vcat(sup_risks, [main_r])
+        last_global_cov = global_cov
+        converged_iter  = iter
 
-        # Convergence: primary path is unchanged from what support agents
-        # were targeting — no new information to exploit.
         if main_path == provisional_path
             println("  Converged at iteration $iter.")
             break
         end
 
-        # Primary path changed — update provisional so next iteration's support
-        # agents target the route the primary agent actually wants to take.
-        # provisional_dist stays fixed at solo_dist: it represents how far the
-        # primary would travel alone and is the correct permanent cap on support
-        # travel regardless of how the primary path refines. Shrinking it each
-        # iteration was restricting support agents more than iteration 1 and
-        # causing them to cover the route less well, raising risk.
         provisional_path = main_path
     end
 
     return best_paths, best_dists, best_risks,
-           [copy(graph.landmarks[i].cov) for i in 1:n],   # return original cov for reference
+           last_global_cov,
            shortest_path, shortest_dist, solo_risk, converged_iter
 end
 
@@ -552,24 +514,24 @@ end
 # Landmark graph setup
 # ----------------------
 landmarks = [
-    Landmark(0.1,  0.1,  [0.1 0.0; 0.0 0.1]),
-    Landmark(2.3,  7.1,  [0.47 0.1; 0.1 0.22]),
-    Landmark(5.8,  1.4,  [0.21 -0.05; -0.05 0.12]),
-    Landmark(9.2,  3.7,  [0.33 0.0; 0.0 0.08]),
-    Landmark(1.1,  8.9,  [0.05 0.02; 0.02 0.03]),
-    Landmark(6.4,  2.2,  [0.50 0.0; 0.0 0.50]),
-    Landmark(3.9,  5.6,  [0.12 -0.02; -0.02 0.06]),
-    Landmark(7.7,  0.8,  [0.38 0.1; 0.1 0.16]),
-    Landmark(4.5,  9.3,  [0.29 -0.05; -0.05 0.1]),
-    Landmark(8.8,  6.1,  [0.08 0.0; 0.0 0.02]),
-    Landmark(0.6,  4.4,  [0.19 0.05; 0.05 0.09]),
-    Landmark(10.2, 1.9,  [0.41 -0.1; -0.1 0.2]),
-    Landmark(12.5, 7.8,  [0.22 0.0; 0.0 0.22]),
-    Landmark(14.1, 3.3,  [0.49 0.1; 0.1 0.3]),
-    Landmark(11.7, 9.0,  [0.31 0.0; 0.0 0.15]),
-    Landmark(13.4, 2.7,  [0.07 0.02; 0.02 0.04]),
-    Landmark(16.0, 5.2,  [0.25 -0.05; -0.05 0.2]),
-    Landmark(14.9, 14.9, 1e-9 * [1.0 0.0; 0.0 1.0])   # goal: tiny cov so fuse_cov stays invertible
+    Landmark(0.5, 0.5, [0.0400 0.0000; 0.0000 0.0400]),
+    Landmark(2.0, 2.5, [0.0765 0.0113; 0.0113 0.0435]),
+    Landmark(4.5, 0.5, [0.0570 -0.0072; -0.0072 0.0430]),
+    Landmark(1.5, 6.0, [0.1065 0.0064; 0.0064 0.0435]),
+    Landmark(6.8, 3.2, [0.0519 0.0108; 0.0108 0.0381]),
+    Landmark(3.8, 8.8, [0.0875 -0.0095; -0.0095 0.0425]),
+    Landmark(8.5, 6.5, [0.0596 0.0118; 0.0118 0.0504]),
+    Landmark(10.5, 3.0, [0.0944 -0.0224; -0.0224 0.0656]),
+    Landmark(7.2, 11.5, [0.0690 0.0080; 0.0080 0.0310]),
+    Landmark(9.0, 9.5, [0.0826 0.0130; 0.0130 0.0574]),
+    Landmark(12.8, 5.5, [0.0776 -0.0120; -0.0120 0.0424]),
+    Landmark(11.0, 12.5, [0.0587 0.0028; 0.0028 0.0313]),
+    Landmark(14.5, 7.0, [0.0857 -0.0275; -0.0275 0.0643]),
+    Landmark(13.2, 11.0, [0.0609 0.0093; 0.0093 0.0491]),
+    Landmark(15.8, 10.0, [0.0862 -0.0043; -0.0043 0.0438]),
+    Landmark(14.0, 14.5, [0.0683 0.0125; 0.0125 0.0317]),
+    Landmark(16.8, 12.5, [0.0719 -0.0123; -0.0123 0.0481]),
+    Landmark(16.0, 15.0, 1e-9 * [1.0 0.0; 0.0 1.0])
 ]
 
 graph = generate_graph(landmarks)
@@ -601,7 +563,7 @@ scatter!(plt, [x_coords[end]], [y_coords[end]],  label="Goal",  marker=:star5, c
 # ----------------------
 # Run
 # ----------------------
-paths, dists, risks, _, shortest_path, shortest_dist, solo_risk, converged_iter =
+paths, dists, risks, final_global_cov, shortest_path, shortest_dist, solo_risk, converged_iter =
     multi_agent_rcsp(graph, risk_threshold, NUM_AGENTS; max_iter=5)
 
 println("Shortest path (target) : ", shortest_path,
@@ -628,24 +590,238 @@ else
 end
 
 # ----------------------
+# Covariance trace using support-updated global_cov
+# ----------------------
+function trace_path_covariances(graph::LandmarkGraph,
+                                 path::Vector{Int},
+                                 global_cov::Vector{Matrix{Float64}})
+    isempty(path) && return Matrix{Float64}[]
+
+    covs = Matrix{Float64}[]
+    current_cov = copy(global_cov[path[1]])
+    push!(covs, copy(current_cov))
+
+    goal_node = path[end]
+    for k in 2:length(path)
+        v = path[k-1]
+        u = path[k]
+        edge_dist = graph.distance[v, u]
+        angle     = graph.orientation[v, u]
+        # Always accumulate dead-reckoning drift
+        current_cov = current_cov + growth_covariance(edge_dist, angle)
+        # Only fuse landmark measurement if this is NOT the goal node
+        if u != goal_node
+            current_cov = fuse_cov(current_cov, global_cov[u])
+        end
+        push!(covs, copy(current_cov))
+    end
+
+    return covs
+end
+
+# ----------------------
+# B-Spline Interpolation
+# ----------------------
+# ----------------------
+# B-Spline Interpolation
+# ----------------------
+# Each graph node gets two flanking control points placed a fraction `tightness`
+# of the edge length along the incoming and outgoing edge directions.  This
+# pulls the spline tightly through every node while keeping C² continuity.
+#
+# All agents are sampled at exactly BSPLINE_NPTS points so the resulting
+# coordinate vectors are the same length for downstream optimisation.
+
+const BSPLINE_NPTS  = 20   # uniform sample count across ALL agents
+const FLANK_RATIO   = 0.18  # minimum flank offset as fraction of edge length
+const AUV_TURN_RADIUS = 4.0 # minimum turning radius in graph units (40m / 10m per unit)
+
+# -----------------------------------------------------------------------
+# Minimum flank distance to honour a turning radius constraint at a node.
+#
+# For a symmetric cubic B-spline corner the radius of curvature at the
+# node apex is:
+#
+#   R ≈ (3/4) * h / sin²(α/2)          ... (*)
+#
+# where h is the flank offset (same on both sides) and α is the exterior
+# turning angle (π − interior angle).  Rearranging for the required h:
+#
+#   h_min = (4/3) * R_min * sin²(α/2)
+#
+# This is exact for a symmetric corner; for asymmetric flanks (different
+# incoming / outgoing edge lengths) we apply the same h_min to both sides,
+# which is conservative (actual R ≥ R_min).
+# -----------------------------------------------------------------------
+function min_flank_for_radius(dx_in, dy_in, dx_out, dy_out,
+                               R_min::Float64)::Float64
+    # Unit vectors along incoming and outgoing edges
+    d_in  = hypot(dx_in,  dy_in)
+    d_out = hypot(dx_out, dy_out)
+    (d_in < 1e-12 || d_out < 1e-12) && return 0.0
+
+    ux_in  =  dx_in  / d_in;  uy_in  =  dy_in  / d_in
+    ux_out =  dx_out / d_out; uy_out =  dy_out / d_out
+
+    # cos of interior angle between the two edge directions
+    cos_int = clamp(ux_in * ux_out + uy_in * uy_out, -1.0, 1.0)
+    # exterior turning angle α = π − interior angle
+    alpha   = π - acos(cos_int)
+
+    sin2_half = sin(alpha / 2)^2           # sin²(α/2)
+    return (4.0 / 3.0) * R_min * sin2_half
+end
+
+function bspline_basis(t::Float64)
+    b0 = (1 - t)^3 / 6
+    b1 = (3t^3 - 6t^2 + 4) / 6
+    b2 = (-3t^3 + 3t^2 + 3t + 1) / 6
+    b3 = t^3 / 6
+    return b0, b1, b2, b3
+end
+
+# Evaluate the B-spline defined by control points (px, py) at global parameter
+# s ∈ [0, 1] mapped uniformly across all spans.
+function bspline_eval(px::Vector{Float64}, py::Vector{Float64}, s::Float64)
+    m = length(px)
+    num_spans = m - 3
+    span_s = s * num_spans          # continuous span index
+    i = clamp(floor(Int, span_s) + 1, 1, num_spans)
+    t = span_s - (i - 1)           # local parameter within span ∈ [0,1)
+    b0, b1, b2, b3 = bspline_basis(t)
+    x = b0*px[i] + b1*px[i+1] + b2*px[i+2] + b3*px[i+3]
+    y = b0*py[i] + b1*py[i+1] + b2*py[i+2] + b3*py[i+3]
+    return x, y
+end
+
+# Build the expanded control-point sequence with two flanking points per node.
+#
+# Flank distance at each interior node is:
+#   max(FLANK_RATIO * min(d_in, d_out),  h_min_from_turn_radius)
+#
+# capped at 0.45 * the shorter edge so flanks never cross each other or
+# overshoot the midpoint of an edge.
+function expand_control_points(xs::Vector{Float64}, ys::Vector{Float64};
+                                R_min::Float64 = AUV_TURN_RADIUS)
+    n = length(xs)
+    px = Float64[]; py = Float64[]
+
+    for k in 1:n
+        if k == 1
+            if n > 1
+                dx = xs[2] - xs[1]; dy = ys[2] - ys[1]
+                d  = hypot(dx, dy)
+                frac = clamp(FLANK_RATIO, 0.0, 0.45)
+                push!(px, xs[1]);                   push!(py, ys[1])
+                push!(px, xs[1] + frac * dx);       push!(py, ys[1] + frac * dy)
+            else
+                push!(px, xs[1]); push!(py, ys[1])
+            end
+
+        elseif k == n
+            dx = xs[n] - xs[n-1]; dy = ys[n] - ys[n-1]
+            d  = hypot(dx, dy)
+            frac = clamp(FLANK_RATIO, 0.0, 0.45)
+            push!(px, xs[n] - frac * dx);       push!(py, ys[n] - frac * dy)
+            push!(px, xs[n]);                   push!(py, ys[n])
+
+        else
+            dx_in  = xs[k]   - xs[k-1]; dy_in  = ys[k]   - ys[k-1]
+            dx_out = xs[k+1] - xs[k];   dy_out = ys[k+1] - ys[k]
+            d_in   = hypot(dx_in,  dy_in)
+            d_out  = hypot(dx_out, dy_out)
+
+            # Required flank length to keep R ≥ R_min at this node
+            h_turn = min_flank_for_radius(dx_in, dy_in, dx_out, dy_out, R_min)
+
+            # Ratio-based minimum, capped so flanks don't overshoot edge midpoints
+            h_ratio = FLANK_RATIO * min(d_in, d_out)
+            h       = clamp(max(h_ratio, h_turn), 0.0, 0.45 * min(d_in, d_out))
+
+            # Pre-flank: step back along unit incoming direction
+            ux_in = dx_in / d_in; uy_in = dy_in / d_in
+            push!(px, xs[k] - h * ux_in);  push!(py, ys[k] - h * uy_in)
+            # Node itself
+            push!(px, xs[k]);               push!(py, ys[k])
+            # Post-flank: step forward along unit outgoing direction
+            ux_out = dx_out / d_out; uy_out = dy_out / d_out
+            push!(px, xs[k] + h * ux_out); push!(py, ys[k] + h * uy_out)
+        end
+    end
+    return px, py
+end
+
+function bspline_curve(xs::Vector{Float64}, ys::Vector{Float64};
+                        npts::Int = BSPLINE_NPTS)
+    n = length(xs)
+    n == 1 && return xs, ys
+    n == 2 && return collect(range(xs[1], xs[2], length=npts)),
+                     collect(range(ys[1], ys[2], length=npts))
+
+    # Expand to flanked control points then clamp endpoints
+    epx, epy = expand_control_points(xs, ys)
+    px = [epx[1]; epx[1]; epx; epx[end]; epx[end]]
+    py = [epy[1]; epy[1]; epy; epy[end]; epy[end]]
+
+    # Sample at exactly npts uniformly spaced parameter values
+    out_x = Vector{Float64}(undef, npts)
+    out_y = Vector{Float64}(undef, npts)
+    for j in 1:npts
+        s = (j - 1) / (npts - 1)
+        out_x[j], out_y[j] = bspline_eval(px, py, s)
+    end
+    return out_x, out_y
+end
+
+# ----------------------
 # Plot
 # ----------------------
-agent_colors = [:purple, :teal, :darkorange, :crimson]
+agent_colors = [:purple, :teal, :darkorange, :crimson, :magenta, :brown,
+                :lime, :navy, :coral, :olive]
 
 for (i, path) in enumerate(paths)
     isempty(path) && continue
     path_x = [graph.landmarks[idx].x for idx in path]
     path_y = [graph.landmarks[idx].y for idx in path]
+
+    # Raw straight-line segments (faint reference)
     if i == length(paths)
-        plot!(plt, path_x, path_y, label="Primary agent", color=:blue, linewidth=2)
+        plot!(plt, path_x, path_y,
+              label=false, color=:blue, linewidth=0.6, linestyle=:dot, alpha=0.35)
     else
         clr = i <= length(agent_colors) ? agent_colors[i] : :gray
-        plot!(plt, path_x, path_y, label="Support agent $i",
-              color=clr, linewidth=1, linestyle=:dash)
+        plot!(plt, path_x, path_y,
+              label=false, color=clr, linewidth=0.4, linestyle=:dot, alpha=0.25)
+    end
+
+    # B-spline smooth curve — always BSPLINE_NPTS points
+    sx, sy = bspline_curve(path_x, path_y; npts=BSPLINE_NPTS)
+    if i == length(paths)
+        plot!(plt, sx, sy, label="Primary agent (B-spline)", color=:blue, linewidth=2.5)
+    else
+        clr = i <= length(agent_colors) ? agent_colors[i] : :gray
+        plot!(plt, sx, sy, label="Support agent $i (B-spline)",
+              color=clr, linewidth=1.4, linestyle=:dash)
     end
 end
 
-xlabel!(plt, "x"); ylabel!(plt, "y")
-title!(plt, "Multi-Agent Paths (comm-aware support)")
-savefig(plt, "multi_agent_paths.png")
-println("\nPlot saved to multi_agent_paths.png")
+# Scatter control-point landmarks on top so they remain visible
+scatter!(plt, x_coords[2:end-1], y_coords[2:end-1],
+         label=false, color=:black, markersize=2.5)
+
+primary_path = paths[end]
+if !isempty(primary_path)
+    path_covs = trace_path_covariances(graph, primary_path, final_global_cov)
+    for (k, node) in enumerate(primary_path)
+        lm = graph.landmarks[node]
+        draw_covariance_ellipse!(plt, lm.x, lm.y, path_covs[k];
+                                 nstd=2, color=:blue, alpha=0.18)
+    end
+    plot!(plt, [NaN], [NaN], seriestype=:shape,
+          color=:blue, alpha=0.18, label="Primary 95% cov")
+end
+
+xlabel!(plt, "x (×10m)"); ylabel!(plt, "y (×10m)")
+title!(plt, "Underwater AUV Swarm — Continuous B-Spline Trajectories")
+savefig(plt, "multi_agent_paths_bspline.png")
+println("\nPlot saved to multi_agent_paths_bspline.png")
