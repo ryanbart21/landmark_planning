@@ -9,57 +9,61 @@ Random.seed!(42)  # Reproducible jittered grid sampling
 # ----------------------
 # Constants & Parameters
 # ----------------------
+# Run knobs (change these most often between experiments)
+const NUM_AGENTS                 = 2
+const PIPELINE_MODE              = :discrete_then_continuous
+const PRIMARY_EPSILON            = 0.0
+
+const UNC_RADIUS_THRESHOLD       = 3.75
+const UNC_FEAS_TOL               = 1e-6
+
+const ENABLE_RELAXED_DISCRETE_FOR_CONTINUOUS = true
+const RELAXED_DISCRETE_DELTA_MODE = :relative
+const RELAXED_DISCRETE_DELTA_ABS  = 0.20
+const RELAXED_DISCRETE_DELTA_REL  = 0.2
+const CONTINUE_ASTAR_ON_INFEASIBLE = true
+
+const PRUNE_BY_COMM_RADIUS_JOINT = false
+const PRUNE_BY_PRIMARY_UNCERTAINTY = false
+const PRUNE_BY_SUPPORT_UNCERTAINTY = false
+
+const STRAIGHT_CONT_PRIMARY_WPTS = 11
+
 # Physical scale: 1 unit = 100m. Graph spans ~1600m x 1500m.
 # Platform: AUV with DVL+IMU dead reckoning, acoustic landmark fixes.
 #
 # DIR_UNCERTAINTY_PER_METER : 10% dead-reckoning drift (DVL+IMU, along-track)
 # MAJ_MIN_UNC_RATIO         : along-track drift ~3x cross-track (DVL characteristic)
-# SENSOR_NOISE              : USBL/LBL fix accuracy ~10m (0.1 units)
-# COMM_RADIUS               : acoustic modem range ~1000m (10 units)
+# SENSOR_NOISE              : USBL/LBL fix accuracy on the order of 10m (0.1 units)
+# COMM_RADIUS               : acoustic modem range on the order of a few hundred meters
 # UNC_RADIUS_THRESHOLD      : max acceptable sqrt(λ_max(Σ_goal)) at goal (~50m = 0.5 units)
 
 const DIR_UNCERTAINTY_PER_METER  = 0.05    # LOWERED from 0.30 to make path length more impactful on final uncertainty
 const MAJ_MIN_UNC_RATIO          = 3
 const PERP_UNCERTAINTY_PER_METER = DIR_UNCERTAINTY_PER_METER / MAJ_MIN_UNC_RATIO
 const MARKER_PROPORTION          = 5.0
-const NUM_AGENTS                 = 2
 const SENSOR_NOISE               = 0.038   # High-precision bearing-based landmark acoustic fixes
-const COMM_RADIUS                = 500.0    # acoustic modem ~300m (3 units); 100m wide tapered Gaussian
-const VISIBILITY_SIGMA           = 50.0     # 1σ detection range for landmark observations
-const COMM_INTERVAL              = 10.0    # Fixed synchronous communication every 10m of travel
-const COMM_SIGMA                 = 150.0    # Gaussian taper: σ=50m means ~1σ=50m, ~3σ=150m (100m ≈ 2σ)
-const UNC_RADIUS_THRESHOLD       = 2.964   # Achievable with meaningful lateral detours toward landmarks
-const HEX_WIDTH_M                = 80.0
+const COMM_RADIUS                = 300.0    # conservative acoustic modem range (~3 units)
+const VISIBILITY_SIGMA           = 75.0     # 1σ detection range for landmark observations
+const COMM_INTERVAL              = 100.0    # synchronous communication checkpoint every 50m of travel
+const COMM_SIGMA                 = 50.0    # Gaussian taper for comm weighting; soft falloff over ~1-3σ
+const HEX_WIDTH_M                = 100.0
 const HEX_RADIUS_M               = HEX_WIDTH_M / sqrt(3.0)  # pointy-top hex: width = sqrt(3)*radius
-const SUPPORT_PLOT_OFFSET_M      = 18.0  # visualization-only offset so support paths stay visible
-
-# ε-optimal parameter for primary-cost weighting in A* (f = g + (1+ε)h)
-# Set >0 for faster search with bounded suboptimality.
-const PRIMARY_EPSILON = 0.0
+const SUPPORT_PLOT_OFFSET_M      = 3.0  # visualization-only offset so support paths stay visible
 
 # Support idling preference used only as a lower-priority tie-break key.
 const SUPPORT_IDLE_PENALTY  = 30.0
 
-# Pipeline mode switch:
-#  :discrete_then_continuous => run discrete planner first, then continuous refinement
-#  :straight_continuous      => skip discrete planner and seed continuous stage with direct start->goal path
-const PIPELINE_MODE = :discrete_then_continuous
+# Relaxed discrete acceptance for discrete->continuous pipeline.
+# When enabled, discrete search may return seeds with goal uncertainty up to
+# UNC_RADIUS_THRESHOLD + δ, and continuous refinement tries to reduce below the
+# true threshold. This can reduce discrete A* work on tight constraints.
+# Delta model:
+#   :absolute => δ = RELAXED_DISCRETE_DELTA_ABS
+#   :relative => δ = RELAXED_DISCRETE_DELTA_REL * UNC_RADIUS_THRESHOLD
 
-# When true, primary-only feasibility is not accepted early; supports are still
-# searched so you can see whether they improve the primary uncertainty.
-const REQUIRE_SUPPORT_REFINEMENT = true
-
-# Number of straight-line control points used to seed primary continuous optimization
-# when PIPELINE_MODE == :straight_continuous.
-const STRAIGHT_CONT_PRIMARY_WPTS = 11
-
-# Sequential (primary + supports) search debug animation/progress controls.
-const DEBUG_SEQ_SEARCH_ANIMATE = true
-const DEBUG_SEQ_SEARCH_GIF = "fig_seq_primary_support_search.gif"
-const DEBUG_SEQ_PRIMARY_PROGRESS_EVERY = 200
-const DEBUG_SEQ_SUPPORT_PROGRESS_EVERY = 200
-const DEBUG_SEQ_ANIM_PRIMARY_SAMPLE_EVERY = 20
-const DEBUG_SEQ_ANIM_SUPPORT_SAMPLE_EVERY = 20
+# If a relaxed discrete seed or continuous refinement is infeasible under the
+# true threshold, resume discrete A* search under strict feasibility.
 
 # ========================================================================================
 # KALMAN FILTERING & INFORMATION FUSION APPROACH
@@ -183,6 +187,31 @@ end
 
 # Primary scalar uncertainty used by planning/constraints/reporting.
 unc_radius(cov::Matrix{Float64}) = unc_det_radius(cov)
+
+@inline function unc_within_threshold(unc::Float64, threshold::Float64=UNC_RADIUS_THRESHOLD)
+    return unc <= threshold + UNC_FEAS_TOL
+end
+
+@inline function unc_exceeds_threshold(unc::Float64, threshold::Float64=UNC_RADIUS_THRESHOLD)
+    return unc > threshold + UNC_FEAS_TOL
+end
+
+@inline function discrete_relaxation_delta(threshold::Float64=UNC_RADIUS_THRESHOLD)
+    if !ENABLE_RELAXED_DISCRETE_FOR_CONTINUOUS
+        return 0.0
+    end
+    if RELAXED_DISCRETE_DELTA_MODE == :absolute
+        return max(0.0, RELAXED_DISCRETE_DELTA_ABS)
+    elseif RELAXED_DISCRETE_DELTA_MODE == :relative
+        return max(0.0, RELAXED_DISCRETE_DELTA_REL * threshold)
+    else
+        error("Unsupported RELAXED_DISCRETE_DELTA_MODE=$(RELAXED_DISCRETE_DELTA_MODE). Use :absolute or :relative")
+    end
+end
+
+@inline function effective_discrete_unc_threshold(threshold::Float64=UNC_RADIUS_THRESHOLD)
+    return threshold + discrete_relaxation_delta(threshold)
+end
 
 # Covariance partial order for sound dominance pruning:
 # cov_a dominates cov_b iff (cov_b - cov_a) is positive semidefinite.
@@ -433,575 +462,6 @@ function search_shortest_path(graph::LandmarkGraph)
     return reverse!(path), dist[goal]
 end
 
-# ==========================================================================
-# K-Shortest Paths (Simplified Yen's Algorithm)
-# ==========================================================================
-# Computes K distinct simple paths from start→goal, sorted by distance.
-# Returns (paths::Vector{Vector{Int}}, distances::Vector{Float64})
-function k_shortest_paths(graph::LandmarkGraph, K::Int=100)
-    n = graph.n
-    goal = n
-    start = 1
-
-    # Find shortest path first
-    first_path, first_dist = search_shortest_path(graph)
-    isempty(first_path) && return Vector{Int}[], Float64[]
-
-    paths = [first_path]
-    distances = [first_dist]
-
-    # Candidate pool: (path, distance)
-    candidates = Set{Vector{Int}}()  # Track found paths to avoid duplicates
-
-    # For each path found, generate deviations
-    for path_idx in 1:min(K-1, length(paths))
-        curr_path = paths[path_idx]
-        cand_count_before = length(candidates)
-
-        # Try each node as a spur node to generate alternate paths
-        for spur_idx in 1:length(curr_path)-1
-            spur_node = curr_path[spur_idx]
-            root_path = curr_path[1:spur_idx]
-
-            # Create a modified graph that excludes the root path (except spur node)
-            # and all edges from previous path nodes to their successors
-            excluded_nodes = Set(root_path[1:end-1])
-            excluded_edges = Set{Tuple{Int,Int}}()
-            for i in 1:spur_idx-1
-                push!(excluded_edges, (curr_path[i], curr_path[i+1]))
-            end
-
-            # Search for alternate path from spur_node to goal
-            dist_spur = fill(Inf, n)
-            parent_spur = fill(-1, n)
-            dist_spur[spur_node] = 0.0
-            gx = graph.landmarks[goal].x
-            gy = graph.landmarks[goal].y
-            h(v) = hypot(graph.landmarks[v].x - gx, graph.landmarks[v].y - gy)
-
-            pq = PriorityQueue{Int,Float64}()
-            enqueue!(pq, spur_node, h(spur_node))
-
-            while !isempty(pq)
-                v = dequeue!(pq)
-                v == goal && break
-                for u in graph.neighbors[v]
-                    # Skip excluded nodes (except when arriving at goal)
-                    if u in excluded_nodes && u != goal
-                        continue
-                    end
-                    # Skip excluded edges
-                    if (v, u) in excluded_edges
-                        continue
-                    end
-                    nd = dist_spur[v] + graph.distance[v, u]
-                    if nd < dist_spur[u]
-                        dist_spur[u] = nd
-                        parent_spur[u] = v
-                        pq[u] = nd + h(u)
-                    end
-                end
-            end
-
-            # If alternate path exists, reconstruct it
-            if !isinf(dist_spur[goal])
-                spur_path = Int[]
-                v = goal
-                while v != -1
-                    push!(spur_path, v)
-                    v = parent_spur[v]
-                end
-                spur_path = reverse!(spur_path)
-
-                # Concatenate root path + spur path (skip first element of spur to avoid duplication)
-                new_path = vcat(root_path, spur_path[2:end])
-
-                # Only add if we haven't seen it before
-                if new_path ∉ candidates && new_path ∉ paths
-                    new_dist = sum(graph.distance[new_path[i], new_path[i+1]] for i in 1:length(new_path)-1)
-                    push!(candidates, new_path)
-                end
-            end
-        end
-
-        # Pick the best candidate and add to paths
-        if !isempty(candidates)
-            best_path = nothing
-            best_dist = Inf
-            for cand in candidates
-                cand_dist = sum(graph.distance[cand[i], cand[i+1]] for i in 1:length(cand)-1)
-                if cand_dist < best_dist
-                    best_dist = cand_dist
-                    best_path = cand
-                end
-            end
-            if best_dist < Inf
-                push!(paths, best_path)
-                push!(distances, best_dist)
-                delete!(candidates, best_path)
-            else
-                break
-            end
-        else
-            break
-        end
-    end
-
-    # Sort by distance (should already be mostly sorted)
-    perm = sortperm(distances)
-    return paths[perm], distances[perm]
-end
-
-# ==========================================================================
-# Single Support Agent A* (One support at a time)
-# ==========================================================================
-# Optimize a single support agent's path given:
-#   - Fixed primary path
-#   - Fixed positions of other supports (if any)
-#
-# Returns best path for this support that minimizes primary's goal uncertainty
-
-function single_support_astar(graph::LandmarkGraph,
-                             lms::Vector{Landmark},
-                             primary_path::Vector{Int},
-                             primary_path_dist::Float64,
-                             other_support_paths::Vector{Vector{Int}},
-                             support_idx::Int;
-                             unc_threshold::Float64=Inf,
-                             max_expansions::Int=100000,
-                             debug_support_label::String="",
-                             debug_progress_every::Int=0,
-                             debug_anim_sample_every::Int=0,
-                             debug_on_frame::Union{Nothing, Function}=nothing)
-    n = graph.n
-    plen = length(primary_path)
-    plen == 0 && return Int[], Inf
-
-    # 1σ gate for catch-up feasibility pruning.
-    # The support branch is pruned only when it can never re-enter this gate
-    # at any future synchronized timestep.
-    function in_sigma_range_at_step(support_node::Int, t::Int)
-        pnode = primary_path[t]
-        sx = graph.landmarks[support_node].x
-        sy = graph.landmarks[support_node].y
-        px = graph.landmarks[pnode].x
-        py = graph.landmarks[pnode].y
-        return (sx - px)^2 + (sy - py)^2 <= COMM_SIGMA^2
-    end
-
-    # Precompute candidate communication nodes for each primary timestep using 1σ,
-    # except the terminal timestep where we allow full COMM_RADIUS.
-    comm_nodes_by_t = Vector{Vector{Int}}(undef, plen)
-    for t in 1:plen
-        pnode = primary_path[t]
-        px = graph.landmarks[pnode].x
-        py = graph.landmarks[pnode].y
-        range_limit = (t == plen) ? COMM_RADIUS : COMM_SIGMA
-        comm_nodes = Int[]
-        for v in 1:n
-            vx = graph.landmarks[v].x
-            vy = graph.landmarks[v].y
-            if (vx - px)^2 + (vy - py)^2 <= range_limit^2
-                push!(comm_nodes, v)
-            end
-        end
-        comm_nodes_by_t[t] = comm_nodes
-    end
-
-    # Optimistic hop lower-bound for catch-up check.
-    # Uses max edge length so ceil(sp_dist / max_edge_len) is a valid lower bound on hops.
-    max_edge_len = 0.0
-    for i in 1:n
-        for j in graph.neighbors[i]
-            max_edge_len = max(max_edge_len, graph.distance[i, j])
-        end
-    end
-    max_edge_len = max(max_edge_len, 1e-9)
-
-    function can_ever_reconnect(node::Int, t::Int)
-        for τ in t:plen
-            # Immediate in-range match at same timestep.
-            if (τ == plen && (graph.landmarks[node].x - graph.landmarks[primary_path[τ]].x)^2 +
-                             (graph.landmarks[node].y - graph.landmarks[primary_path[τ]].y)^2 <= COMM_RADIUS^2) ||
-               (τ < plen && in_sigma_range_at_step(node, τ))
-                return true
-            end
-
-            # Optimistic future catch-up test via graph shortest-path distance.
-            targets = comm_nodes_by_t[τ]
-            isempty(targets) && continue
-
-            dmin = Inf
-            for v in targets
-                dmin = min(dmin, graph.shortest_paths[node, v])
-            end
-            isfinite(dmin) || continue
-
-            hops_lb = Int(ceil(dmin / max_edge_len - 1e-9))
-            if hops_lb <= (τ - t)
-                return true
-            end
-        end
-        return false
-    end
-
-    function primary_goal_unc_with_support(candidate_support_path::Vector{Int})
-        support_paths = copy(other_support_paths)
-        push!(support_paths, pad_path_to_length(candidate_support_path, plen))
-        full_paths = vcat(support_paths, [primary_path])
-        final_covs, _ = evaluate_full_paths(full_paths, graph, lms, length(full_paths))
-        return unc_radius(final_covs[end])
-    end
-
-    function reconstruct_support_path(si::Int)
-        path = Int[]
-        cur = si
-        while cur != -1
-            pushfirst!(path, state_nodes[cur])
-            cur = state_parent[cur]
-        end
-        return path
-    end
-
-    if !can_ever_reconnect(1, 1)
-        return Int[], Inf
-    end
-
-    state_nodes = Int[1]
-    state_t = Int[1]
-    state_dist = Float64[0.0]
-    state_parent = Int[-1]
-    state_unc = Float64[primary_goal_unc_with_support([1])]
-
-    # Uncertainty-first queue: minimize estimated primary uncertainty first,
-    # then use support travel distance as a tie-breaker.
-    pq = PriorityQueue{Int, Tuple{Float64, Float64}}()
-    enqueue!(pq, 1, (state_unc[1], 0.0))
-
-    # Dominance by (t, node): keep all labels that are not strictly worse in
-    # estimated primary uncertainty. Equal-uncertainty labels are retained.
-    best_unc_at = Dict{Tuple{Int, Int}, Float64}()
-    best_unc_at[(1, 1)] = state_unc[1]
-
-    best_terminal_unc = Inf
-    best_terminal_si = 0
-    best_progress_unc = Inf
-    best_progress_si = 0
-    expanded = 0
-
-    function partial_unc_estimate(si_est::Int)
-        path_est = reconstruct_support_path(si_est)
-        padded_est = pad_path_to_length(path_est, plen)
-        return primary_goal_unc_with_support(padded_est)
-    end
-
-    while !isempty(pq)
-        si = dequeue!(pq)
-        node = state_nodes[si]
-        t = state_t[si]
-        dist_so_far = state_dist[si]
-        cur_unc = state_unc[si]
-
-        expanded += 1
-        if debug_progress_every > 0 && mod(expanded, debug_progress_every) == 0
-            if isfinite(cur_unc)
-                best_progress_unc = min(best_progress_unc, cur_unc)
-                best_progress_si = si
-            end
-            shown_unc = isfinite(best_terminal_unc) ? best_terminal_unc : min(best_progress_unc, cur_unc)
-            shown_unc_txt = isfinite(shown_unc) ? string(round(shown_unc, digits=4)) : "n/a"
-            println("  [Support $support_idx] $(debug_support_label) expanded=$expanded, t=$t/$plen, queue=$(length(pq)), best_unc=$(shown_unc_txt)")
-        end
-
-        if debug_on_frame !== nothing && debug_anim_sample_every > 0 && mod(expanded, debug_anim_sample_every) == 0
-            partial_path = Int[]
-            curp = si
-            while curp != -1
-                pushfirst!(partial_path, state_nodes[curp])
-                curp = state_parent[curp]
-            end
-            debug_on_frame(partial_path, expanded, t)
-        end
-
-        if expanded > max_expansions
-            break
-        end
-
-        if t == plen
-            path = Int[]
-            cur = si
-            while cur != -1
-                pushfirst!(path, state_nodes[cur])
-                cur = state_parent[cur]
-            end
-
-            cand_unc = primary_goal_unc_with_support(path)
-            if cand_unc < best_terminal_unc - 1e-9
-                best_terminal_unc = cand_unc
-                best_terminal_si = si
-            end
-            if cand_unc <= unc_threshold
-                println("  [Support $support_idx] feasible terminal path found at expanded=$expanded, unc=$(round(cand_unc, digits=4))")
-            end
-            continue
-        end
-
-        next_t = t + 1
-
-        # Support can either hold position or move by one graph edge each timestep.
-        nbrs = copy(graph.neighbors[node])
-        push!(nbrs, node)
-
-        for u in nbrs
-            edge_dist = (u == node) ? 0.0 : graph.distance[node, u]
-            new_dist = dist_so_far + edge_dist
-
-            # Prune only if the support can never catch up to 1σ communication
-            # during the search, or reach COMM_RADIUS at the terminal timestep.
-            if !can_ever_reconnect(u, next_t)
-                continue
-            end
-
-            candidate_path = reconstruct_support_path(si)
-            push!(candidate_path, u)
-            candidate_path = pad_path_to_length(candidate_path, plen)
-            new_unc = primary_goal_unc_with_support(candidate_path)
-
-            key = (next_t, u)
-            old_best = get(best_unc_at, key, Inf)
-            if new_unc > old_best + 1e-9
-                continue
-            end
-
-            push!(state_nodes, u)
-            push!(state_t, next_t)
-            push!(state_dist, new_dist)
-            push!(state_parent, si)
-            push!(state_unc, new_unc)
-            new_si = length(state_nodes)
-            if new_unc < old_best - 1e-9
-                best_unc_at[key] = new_unc
-            elseif !haskey(best_unc_at, key)
-                best_unc_at[key] = new_unc
-            end
-            enqueue!(pq, new_si, (new_unc, new_dist))
-        end
-    end
-
-    if best_terminal_si == 0
-        if isfinite(best_progress_unc)
-            progress_path = best_progress_si == 0 ? [1] : reconstruct_support_path(best_progress_si)
-            return pad_path_to_length(progress_path, plen), best_progress_unc
-        end
-        return Int[], Inf
-    end
-
-    fallback_path = Int[]
-    cur = best_terminal_si
-    while cur != -1
-        pushfirst!(fallback_path, state_nodes[cur])
-        cur = state_parent[cur]
-    end
-    return pad_path_to_length(fallback_path, plen), best_terminal_unc
-end
-
-function first_feasible_primary_with_sequential_supports(graph::LandmarkGraph,
-                                                         lms::Vector{Landmark},
-                                                         unc_threshold::Float64,
-                                                         num_agents::Int;
-                                                         max_primary_expansions::Int=800000,
-                                                         max_support_expansions::Int=100000,
-                                                         max_primary_candidates::Int=2000,
-                                                         debug_animate::Bool=false,
-                                                         debug_gif_path::String="fig_seq_primary_support_search.gif",
-                                                         debug_primary_progress_every::Int=0,
-                                                         debug_support_progress_every::Int=0,
-                                                         debug_anim_primary_sample_every::Int=0,
-                                                         debug_anim_support_sample_every::Int=0)
-    n = graph.n
-    goal = n
-    na = num_agents
-    ns = max(na - 1, 0)
-
-    states = PrimaryState[]
-    init_vis = falses(n)
-    init_vis[1] = true
-    push!(states, PrimaryState(1, 0.0, -1, init_vis))
-
-    pq = PriorityQueue{Int, Tuple{Float64, Float64}}()
-    h0 = graph.shortest_paths[1, goal]
-    enqueue!(pq, 1, (h0, 0.0))
-
-    expanded = 0
-    goal_candidates = 0
-    anim = debug_animate ? Plots.Animation() : nothing
-
-    function push_seq_frame(stage::String, iter_txt::String,
-                            prim_path::Vector{Int}, sup_paths::Vector{Vector{Int}})
-        debug_animate || return
-        plt = plot_sequential_search_frame(graph, lms, prim_path, sup_paths;
-                                           stage_label=stage,
-                                           iter_label=iter_txt)
-        frame(anim, plt)
-    end
-
-    function reconstruct_primary(si::Int)
-        path = Int[]
-        cur = si
-        while cur != -1
-            pushfirst!(path, states[cur].node)
-            cur = states[cur].parent
-        end
-        return path
-    end
-
-    while !isempty(pq)
-        si = dequeue!(pq)
-        S = states[si]
-
-        if debug_primary_progress_every > 0 && mod(expanded + 1, debug_primary_progress_every) == 0
-            println("  [Primary Search] expanded=$(expanded + 1), queue=$(length(pq)), goal_candidates=$goal_candidates")
-        end
-
-        if debug_animate && debug_anim_primary_sample_every > 0 && mod(expanded + 1, debug_anim_primary_sample_every) == 0
-            prim_dbg = reconstruct_primary(si)
-            push_seq_frame("Primary frontier", "exp=$(expanded + 1)", prim_dbg, [Int[] for _ in 1:ns])
-        end
-
-        if S.node == goal
-            goal_candidates += 1
-            prim_path = reconstruct_primary(si)
-            prim_dist = S.g
-
-            println("  [Primary Search] Goal candidate #$goal_candidates dist=$(round(prim_dist, digits=3)), nodes=$(length(prim_path))")
-            push_seq_frame("Primary goal candidate", "k=$goal_candidates", prim_path, [Int[] for _ in 1:ns])
-
-            # First check whether this primary candidate is already feasible with
-            # supports simply idling at start. This avoids false infeasibility when
-            # support pruning is intentionally aggressive.
-            idle_supports = [fill(1, length(prim_path)) for _ in 1:ns]
-            idle_full_paths = vcat(idle_supports, [prim_path])
-            idle_covs, idle_dists = evaluate_full_paths(idle_full_paths, graph, lms, na)
-            idle_prim_unc = unc_radius(idle_covs[end])
-            if idle_prim_unc <= unc_threshold
-                println("  ✓ Primary-only feasible at candidate #$goal_candidates: dist=$(round(idle_dists[end], digits=3)), unc=$(round(idle_prim_unc, digits=4))")
-                push_seq_frame("Primary-only feasible", "candidate#$goal_candidates", prim_path, idle_supports)
-                if !REQUIRE_SUPPORT_REFINEMENT
-                    if debug_animate
-                        gif(anim, debug_gif_path, fps=15)
-                        println("  [Seq Debug] Animation saved to $debug_gif_path")
-                    end
-                    return idle_full_paths, idle_dists, idle_prim_unc, goal_candidates
-                end
-                println("  [Seq Debug] REQUIRE_SUPPORT_REFINEMENT=true; continuing to refine supports anyway")
-            end
-
-            support_paths = Vector{Vector{Int}}(undef, ns)
-            for sup_idx in 1:ns
-                prior_supports = Vector{Vector{Int}}()
-                for j in 1:(sup_idx - 1)
-                    isempty(support_paths[j]) && continue
-                    push!(prior_supports, support_paths[j])
-                end
-                local_support_frame = function(partial_support_path::Vector{Int}, sup_expanded::Int, step_t::Int)
-                    dbg_supports = [Int[] for _ in 1:ns]
-                    for jj in 1:(sup_idx - 1)
-                        dbg_supports[jj] = support_paths[jj]
-                    end
-                    dbg_supports[sup_idx] = partial_support_path
-                    push_seq_frame("Support $sup_idx search", "exp=$sup_expanded t=$step_t", prim_path, dbg_supports)
-                end
-
-                sup_path, _ = single_support_astar(graph, lms, prim_path, prim_dist, prior_supports, sup_idx;
-                                                   unc_threshold=unc_threshold,
-                                                   max_expansions=max_support_expansions,
-                                                   debug_support_label="candidate#$goal_candidates",
-                                                   debug_progress_every=debug_support_progress_every,
-                                                   debug_anim_sample_every=debug_anim_support_sample_every,
-                                                   debug_on_frame=local_support_frame)
-                if isempty(sup_path)
-                    support_paths[sup_idx] = Int[]
-                    println("  [Support $sup_idx] no feasible support path for primary candidate #$goal_candidates")
-                    break
-                end
-                support_paths[sup_idx] = sup_path
-                push_seq_frame("Support $sup_idx accepted", "candidate#$goal_candidates", prim_path, support_paths)
-            end
-
-            if all(!isempty, support_paths)
-                support_paths = pad_support_paths_to_primary(support_paths, prim_path)
-                full_paths = vcat(support_paths, [prim_path])
-                final_covs, final_dists = evaluate_full_paths(full_paths, graph, lms, na)
-                prim_unc = unc_radius(final_covs[end])
-                if prim_unc <= unc_threshold
-                    println("  ✓ Sequential feasible solution at candidate #$goal_candidates: dist=$(round(final_dists[end], digits=3)), unc=$(round(prim_unc, digits=4))")
-                    push_seq_frame("Sequential feasible solution", "candidate#$goal_candidates", prim_path, support_paths)
-                    if debug_animate
-                        gif(anim, debug_gif_path, fps=15)
-                        println("  [Seq Debug] Animation saved to $debug_gif_path")
-                    end
-                    return full_paths, final_dists, prim_unc, goal_candidates
-                end
-            end
-
-            if goal_candidates >= max_primary_candidates
-                break
-            end
-            continue
-        end
-
-        expanded += 1
-        if expanded > max_primary_expansions
-            break
-        end
-
-        for u in graph.neighbors[S.node]
-            S.visited[u] && continue
-            new_g = S.g + graph.distance[S.node, u]
-            new_h = graph.shortest_paths[u, goal]
-            new_vis = copy(S.visited)
-            new_vis[u] = true
-            push!(states, PrimaryState(u, new_g, si, new_vis))
-            new_si = length(states)
-            enqueue!(pq, new_si, (new_g + new_h, new_g))
-        end
-    end
-
-    if debug_animate
-        gif(anim, debug_gif_path, fps=15)
-        println("  [Seq Debug] Animation saved to $debug_gif_path")
-    end
-
-    return Vector{Vector{Int}}(), Float64[], Inf, goal_candidates
-end
-# Given a fixed primary path, find support paths that minimize primary's endpoint uncertainty.
-# Returns (support_paths::Vector{Vector{Int}}, goal_uncertainty::Float64)
-
-struct SupportState
-    nodes   :: Vector{Int}          # current node per support agent
-    dists   :: Vector{Float64}      # arc-distance per support
-    covs    :: Vector{Matrix{Float64}}  # primary's covariance after fusions
-    g       :: Float64              # primary's endpoint uncertainty
-    parent  :: Int
-    visited :: Vector{BitVector}
-end
-
-struct PrimaryState
-    node::Int
-    g::Float64
-    parent::Int
-    visited::BitVector
-end
-
-struct BeamPrimaryState
-    path::Vector{Int}
-    g::Float64
-    cov::Matrix{Float64}
-    unc::Float64
-    score::Float64
-    visited::BitVector
-end
-
 function pad_path_to_length(path::Vector{Int}, target_len::Int)
     isempty(path) && return Int[]
     padded = copy(path)
@@ -1016,265 +476,11 @@ function pad_support_paths_to_primary(support_paths::Vector{Vector{Int}}, primar
     return [pad_path_to_length(path, target_len) for path in support_paths]
 end
 
-function plot_sequential_search_frame(graph::LandmarkGraph,
-                                      lms::Vector{Landmark},
-                                      primary_path::Vector{Int},
-                                      support_paths::Vector{Vector{Int}};
-                                      stage_label::String="",
-                                      iter_label::String="")
-    plt = plot(legend=:outerright, aspect_ratio=:equal,
-               xlabel="x (m)", ylabel="y (m)",
-               title="Sequential Search: $(stage_label) $(iter_label)")
-
-    # Draw route nodes lightly.
-    xs = [lm.x for lm in graph.landmarks]
-    ys = [lm.y for lm in graph.landmarks]
-    scatter!(plt, xs, ys, label="Nodes", color=:lightgray, markersize=2, markerstrokewidth=0)
-
-    # Draw landmarks as darker points for context.
-    if !isempty(lms)
-        lx = [lm.x for lm in lms]
-        ly = [lm.y for lm in lms]
-        scatter!(plt, lx, ly, label="Landmarks", color=:black, markersize=4, markerstrokewidth=0)
-    end
-
-    # Plot support paths.
-    for (i, sp) in enumerate(support_paths)
-        isempty(sp) && continue
-        sx = [graph.landmarks[j].x for j in sp]
-        sy = [graph.landmarks[j].y for j in sp]
-        plot!(plt, sx, sy, color=:purple, linewidth=1.5,
-              linestyle=:dash, label="Support $i")
-    end
-
-    # Plot primary path.
-    if !isempty(primary_path)
-        px = [graph.landmarks[j].x for j in primary_path]
-        py = [graph.landmarks[j].y for j in primary_path]
-        plot!(plt, px, py, color=:blue, linewidth=2.2, label="Primary")
-    end
-
-    scatter!(plt, [graph.landmarks[1].x], [graph.landmarks[1].y],
-             label="Start", color=:green, markersize=7, markerstrokewidth=0)
-    scatter!(plt, [graph.landmarks[graph.n].x], [graph.landmarks[graph.n].y],
-             label="Goal", color=:orange, marker=:star5, markersize=9, markerstrokewidth=0)
-
-    return plt
-end
-
-function support_astar(graph::LandmarkGraph,
-                       lms::Vector{Landmark},
-                       primary_path::Vector{Int},
-                       primary_path_dist::Float64,
-                       unc_threshold::Float64,
-                       num_supports::Int;
-                       max_expansions::Int=200000)
-    n = graph.n
-    ns = num_supports
-
-    # Compute primary's covariance trajectory along path (no supports initially)
-    primary_covs = [copy(lms[primary_path[1]].cov)]
-    for i in 1:length(primary_path)-1
-        u, v = primary_path[i], primary_path[i+1]
-        edge_cov = edge_cov_continuous(u, v, graph, lms, primary_covs[end])
-        push!(primary_covs, edge_cov)
-    end
-
-    # Initial state: all supports at start
-    init_nodes = fill(1, ns)
-    init_dists = zeros(ns)
-    init_covs = [copy(primary_covs[end]) for _ in 1:1]  # track primary's cov at goal
-    init_visited = [falses(n) for _ in 1:ns]
-    for a in 1:ns
-        init_visited[a][1] = true
-    end
-
-    states = SupportState[]
-    node_tuple_states = Dict{Vector{Int}, Vector{Int}}()
-
-    init_state = SupportState(init_nodes, init_dists, init_covs, unc_radius(init_covs[1]), -1, init_visited)
-    push!(states, init_state)
-    node_tuple_states[copy(init_nodes)] = [1]
-
-    pq = PriorityQueue{Int, Float64}()
-    enqueue!(pq, 1, init_state.g)  # f = g (pure cost, no heuristic for now)
-
-    best_goal_g = Inf
-    best_goal_si = 0
-    best_seen_g = init_state.g
-    best_seen_si = 1
-
-    while !isempty(pq)
-        si = dequeue!(pq)
-        S = states[si]
-
-        tup = S.nodes
-        if !haskey(node_tuple_states, tup) || si ∉ node_tuple_states[tup]
-            continue
-        end
-
-        # Track best feasible solution
-        if S.g <= unc_threshold && S.g < best_goal_g
-            best_goal_g = S.g
-            best_goal_si = si
-        end
-        if S.g < best_seen_g - 1e-9
-            best_seen_g = S.g
-            best_seen_si = si
-        end
-
-        # Expand: try moving each support
-        for moved in 1:ns
-            # Don't let supports travel beyond primary
-            if S.dists[moved] >= primary_path_dist
-                continue
-            end
-
-            for u in graph.neighbors[S.nodes[moved]]
-                if S.visited[moved][u]
-                    continue
-                end
-
-                edge_dist = graph.distance[S.nodes[moved], u]
-                new_dist = S.dists[moved] + edge_dist
-
-                # Support arc budget
-                if new_dist >= primary_path_dist
-                    continue
-                end
-
-                # Build new state
-                new_nodes = copy(S.nodes)
-                new_nodes[moved] = u
-                new_dists = copy(S.dists)
-                new_dists[moved] = new_dist
-
-                # Main trick: track ALL communications between support's path and primary's path
-                # A support at node u can communicate with primary at ANY node in primary_path
-                # that is within COMM_RADIUS. We fuse at the earliest opportunity.
-                ux, uy = graph.landmarks[u].x, graph.landmarks[u].y
-
-                # Compute the best uncertainty reduction from this support position
-                new_primary_cov = copy(primary_covs[end])
-                best_fusion_point = -1
-
-                for pi in 1:length(primary_path)
-                    px = graph.landmarks[primary_path[pi]].x
-                    py = graph.landmarks[primary_path[pi]].y
-                    d2 = (ux - px)^2 + (uy - py)^2
-
-                    if d2 <= COMM_RADIUS^2
-                        # Support can communicate at primary's node pi
-                        # Compute support's covariance at time of communication
-                        sup_node = u
-                        sup_cov = copy(lms[sup_node].cov)
-
-                        # Propagate support covariance along its traveled path
-                        if S.dists[moved] > 0
-                            # Simplified: average angle along path (in practice, recompute from actual path)
-                            sup_angle = graph.orientation[1, sup_node]
-                            sup_cov = growth_covariance(S.dists[moved], sup_angle) .+ sup_cov
-                        end
-
-                        # Fuse at the primary's node pi
-                        primary_cov_at_pi = primary_covs[pi]
-                        fused = fuse_cov(primary_cov_at_pi, sup_cov)
-
-                        # Forward-propagate from pi to goal
-                        cov_to_goal = fused
-                        for pj in pi+1:length(primary_path)-1
-                            pj_u, pj_v = primary_path[pj], primary_path[pj+1]
-                            cov_to_goal = edge_cov_continuous(pj_u, pj_v, graph, lms, cov_to_goal)
-                        end
-
-                        # Take fusion point that gives best (lowest) goal uncertainty
-                        eig_to_goal = max_eigenvalue(cov_to_goal)
-                        eig_no_fusion = max_eigenvalue(new_primary_cov)
-                        if eig_to_goal < eig_no_fusion
-                            new_primary_cov = cov_to_goal
-                            best_fusion_point = pi
-                        end
-                    end
-                end
-
-                new_covs = [new_primary_cov]
-                new_g = unc_radius(new_covs[1])
-
-                # Dominance check
-                dominated = false
-                to_remove = Int[]
-                existing = get(node_tuple_states, new_nodes, Int[])
-                for old_si in existing
-                    old = states[old_si]
-                    if old.g <= new_g
-                        dominated = true
-                        break
-                    end
-                    if new_g < old.g
-                        push!(to_remove, old_si)
-                    end
-                end
-                if dominated
-                    continue
-                end
-
-                for rem in to_remove
-                    idx = findfirst(==(rem), node_tuple_states[new_nodes])
-                    idx !== nothing && deleteat!(node_tuple_states[new_nodes], idx)
-                end
-
-                # Add new state
-                new_visited = [copy(S.visited[a]) for a in 1:ns]
-                new_visited[moved][u] = true
-                push!(states, SupportState(new_nodes, new_dists, new_covs, new_g, si, new_visited))
-                new_si = length(states)
-                if !haskey(node_tuple_states, new_nodes)
-                    node_tuple_states[new_nodes] = Int[]
-                end
-                push!(node_tuple_states[new_nodes], new_si)
-                enqueue!(pq, new_si, new_g)
-            end
-        end
-    end
-
-    # Reconstruct support paths
-    if best_goal_si == 0
-        best_goal_si = best_seen_si
-        best_goal_g = best_seen_g
-    end
-
-    agent_paths = [Int[] for _ in 1:ns]
-    si = best_goal_si
-    prev_nodes = fill(-1, ns)
-    while si != -1
-        S = states[si]
-        for a in 1:ns
-            if S.nodes[a] != get(prev_nodes, a, -1)
-                pushfirst!(agent_paths[a], S.nodes[a])
-            end
-        end
-        prev_nodes = copy(S.nodes)
-        si = S.parent
-    end
-
-    for a in 1:ns
-        unique_path = Int[]
-        for nd in agent_paths[a]
-            if isempty(unique_path) || nd != unique_path[end]
-                push!(unique_path, nd)
-            end
-        end
-        agent_paths[a] = pad_path_to_length(unique_path, length(primary_path))
-    end
-
-    return agent_paths, best_goal_g
-end
-
 # ---------- physics constants ----------
 # BEARING_NOISE_RATIO : ratio of cross-bearing to along-bearing sensor noise
 # COMM_INTERVAL_DIST : arc-distance between inter-agent communication events
 const BEARING_NOISE_RATIO = 2.2               # cross-range noise 2.2× along-range—tighter sensor
-const COMM_INTERVAL_DIST  = 15.0              # comm event every ~1500m of travel (15 units)
+const COMM_INTERVAL_DIST  = 5.0               # comm event every ~500m of travel (5 units)
 
 
 # ==========================================================================
@@ -1585,14 +791,6 @@ end
 # cheap enough to keep search fast.  At graph scale (~1-20 units per edge)
 # 8 samples gives sub-0.1% accuracy vs 100 samples.
 
-# SAMPLE_SPACING: physical distance between covariance evaluation points (units).
-# Both Dijkstra edges and B-splines use this, guaranteeing identical fusion density.
-const SAMPLE_SPACING       = 5.0   # 5 graph units = 500m — used for Bézier/final eval
-const SAMPLE_SPACING_SEARCH = 5.0  # same as SAMPLE_SPACING — coarser spacing caused
-                                    # landmark fusion misses on long edges (up to 32 units)
-                                    # leading to inconsistent evaluations between search
-                                    # and final simulation.  Runtime cost is acceptable.
-
 function edge_cov_continuous(v::Int, u::Int,
                               graph::LandmarkGraph,
                               lms::Vector{Landmark},
@@ -1695,6 +893,21 @@ end
 # is bounded to [0, primary_dist] — supports must not travel further than
 # the primary.
 
+@inline function supports_within_comm_radius(nodes::Vector{Int}, graph::LandmarkGraph, primary::Int)
+    primary_node = nodes[primary]
+    px = graph.landmarks[primary_node].x
+    py = graph.landmarks[primary_node].y
+    for a in 1:(primary - 1)
+        node = nodes[a]
+        dx = graph.landmarks[node].x - px
+        dy = graph.landmarks[node].y - py
+        if dx * dx + dy * dy > COMM_RADIUS^2
+            return false
+        end
+    end
+    return true
+end
+
 struct JointState
     paths   :: Vector{Vector{Int}}  # full path per agent (sequence of nodes); last = primary
     covs    :: Vector{Matrix{Float64}}  # covariance at end of each path
@@ -1725,33 +938,6 @@ end
     Ia = inv2(cov_a .+ noise .* [1.0 0.0; 0.0 1.0])
     new_b = inv2(inv2(cov_b) .+ w .* Ia)
     return new_a, new_b
-end
-
-# ------------------------------------------------------------------
-# Apply all pairwise comms for a newly-expanded agent `moved` given
-# the updated joint state.  Each pair (moved, other) is checked once.
-# Returns updated covs vector (copy).
-# ------------------------------------------------------------------
-function apply_step_comms(covs::Vector{Matrix{Float64}},
-                           nodes::Vector{Int},
-                           dists::Vector{Float64},
-                           graph::LandmarkGraph,
-                           moved::Int)
-    na   = length(covs)
-    covs = copy(covs)   # shallow copy vector; matrices copied below as needed
-    xm   = graph.landmarks[nodes[moved]].x
-    ym   = graph.landmarks[nodes[moved]].y
-    for b in 1:na
-        b == moved && continue
-        # Only comm if arc-distances are close enough to share a comm window
-        abs(dists[moved] - dists[b]) > COMM_INTERVAL_DIST && continue
-        xb = graph.landmarks[nodes[b]].x
-        yb = graph.landmarks[nodes[b]].y
-        new_m, new_b = pairwise_comm(covs[moved], covs[b], xm, ym, xb, yb)
-        covs[moved] = new_m
-        covs[b]     = new_b
-    end
-    return covs
 end
 
 # ------------------------------------------------------------------
@@ -1882,420 +1068,6 @@ function evaluate_full_paths(agent_paths::Vector{Vector{Int}},
     return final_covs, final_dists
 end
 
-# Primary-only uncertainty-constrained A* with optional modeled support effect.
-# Returns (path, dist, goal_unc). If no feasible path is found, path is empty.
-function primary_uncertainty_astar(graph::LandmarkGraph,
-                                   lms::Vector{Landmark},
-                                   unc_threshold::Float64,
-                                   num_agents::Int;
-                                   modeled_support_paths::Union{Nothing, Vector{Vector{Int}}}=nothing,
-                                   max_expansions::Int=200000)
-    n = graph.n
-    goal = n
-    na = num_agents
-    ns = max(na - 1, 0)
-
-    states = PrimaryState[]
-    init_vis = falses(n)
-    init_vis[1] = true
-    push!(states, PrimaryState(1, 0.0, -1, init_vis))
-
-    pq = PriorityQueue{Int, Float64}()
-    enqueue!(pq, 1, graph.shortest_paths[1, goal])
-
-    best_feasible_dist = Inf
-    best_feasible_unc = Inf
-    best_feasible_si = 0
-    expanded = 0
-
-    node_best_g = fill(Inf, n)
-    node_best_g[1] = 0.0
-
-    function reconstruct_primary_path(si::Int)
-        path = Int[]
-        cur = si
-        while cur != -1
-            pushfirst!(path, states[cur].node)
-            cur = states[cur].parent
-        end
-        return path
-    end
-
-    while !isempty(pq)
-        si = dequeue!(pq)
-        S = states[si]
-
-        # Conservative transposition pruning by node-distance only.
-        if S.g > node_best_g[S.node] + 1e-9
-            continue
-        end
-
-        h = graph.shortest_paths[S.node, goal]
-        if S.g + h >= best_feasible_dist - 1e-9
-            continue
-        end
-
-        if S.node == goal
-            prim_path = reconstruct_primary_path(si)
-
-            support_paths = if modeled_support_paths === nothing
-                [copy(prim_path) for _ in 1:ns]
-            else
-                modeled_support_paths
-            end
-
-            full_paths = vcat(support_paths, [prim_path])
-            final_covs, final_dists = evaluate_full_paths(full_paths, graph, lms, na)
-            prim_unc = unc_radius(final_covs[na])
-            prim_dist = final_dists[na]
-
-            if prim_unc <= unc_threshold && prim_dist < best_feasible_dist - 1e-9
-                best_feasible_dist = prim_dist
-                best_feasible_unc = prim_unc
-                best_feasible_si = si
-            end
-            continue
-        end
-
-        expanded += 1
-        if expanded > max_expansions
-            break
-        end
-
-        for u in graph.neighbors[S.node]
-            S.visited[u] && continue
-            edge = graph.distance[S.node, u]
-            new_g = S.g + edge
-            new_h = graph.shortest_paths[u, goal]
-            new_f = new_g + new_h
-            if new_f >= best_feasible_dist - 1e-9
-                continue
-            end
-
-            # Keep only better distance labels at each node.
-            if new_g >= node_best_g[u] - 1e-9
-                continue
-            end
-
-            new_vis = copy(S.visited)
-            new_vis[u] = true
-            push!(states, PrimaryState(u, new_g, si, new_vis))
-            new_si = length(states)
-            node_best_g[u] = new_g
-            enqueue!(pq, new_si, new_f)
-        end
-    end
-
-    if best_feasible_si == 0
-        return Int[], Inf, Inf
-    end
-    return reconstruct_primary_path(best_feasible_si), best_feasible_dist, best_feasible_unc
-end
-
-function beam_primary_uncertainty_seed(graph::LandmarkGraph,
-                                       lms::Vector{Landmark},
-                                       unc_threshold::Float64,
-                                       num_agents::Int;
-                                       modeled_support_paths::Union{Nothing, Vector{Vector{Int}}}=nothing,
-                                       beam_width::Int=24,
-                                       uncertainty_weight::Float64=6.0,
-                                       max_depth::Int=0)
-    n = graph.n
-    goal = n
-    na = num_agents
-    ns = max(na - 1, 0)
-    max_depth = max_depth > 0 ? max_depth : n
-
-    init_cov = copy(lms[1].cov)
-    init_visited = falses(n)
-    init_visited[1] = true
-    init_score = graph.shortest_paths[1, goal]
-    frontier = [BeamPrimaryState([1], 0.0, init_cov, unc_radius(init_cov), init_score, init_visited)]
-
-    best_path = Int[]
-    best_dist = Inf
-    best_unc = Inf
-    best_goal_path = Int[]
-    best_goal_dist = Inf
-    best_goal_unc = Inf
-
-    for _depth in 1:(max_depth - 1)
-        candidates = BeamPrimaryState[]
-
-        for S in frontier
-            last_node = S.path[end]
-            if last_node == goal
-                support_paths = if modeled_support_paths === nothing
-                    [copy(S.path) for _ in 1:ns]
-                else
-                    modeled_support_paths
-                end
-                full_paths = vcat(support_paths, [S.path])
-                final_covs, final_dists = evaluate_full_paths(full_paths, graph, lms, na)
-                cur_unc = unc_radius(final_covs[na])
-                cur_dist = final_dists[na]
-                if cur_dist < best_goal_dist - 1e-9
-                    best_goal_path = copy(S.path)
-                    best_goal_dist = cur_dist
-                    best_goal_unc = cur_unc
-                end
-                if cur_unc <= unc_threshold && cur_dist < best_dist - 1e-9
-                    best_path = copy(S.path)
-                    best_dist = cur_dist
-                    best_unc = cur_unc
-                end
-                continue
-            end
-
-            for u in graph.neighbors[last_node]
-                S.visited[u] && continue
-                edge = graph.distance[last_node, u]
-                new_g = S.g + edge
-                new_h = graph.shortest_paths[u, goal]
-                if new_g + new_h >= best_dist - 1e-9
-                    continue
-                end
-
-                new_cov = edge_cov_continuous(last_node, u, graph, lms, S.cov)
-                new_unc = unc_radius(new_cov)
-                new_score = new_g + new_h + uncertainty_weight * max(0.0, new_unc - unc_threshold)
-
-                new_path = copy(S.path)
-                push!(new_path, u)
-                new_visited = copy(S.visited)
-                new_visited[u] = true
-                push!(candidates, BeamPrimaryState(new_path, new_g, new_cov, new_unc, new_score, new_visited))
-            end
-        end
-
-        isempty(candidates) && break
-
-        best_by_node = Dict{Int, BeamPrimaryState}()
-        for cand in candidates
-            last_node = cand.path[end]
-            if !haskey(best_by_node, last_node)
-                best_by_node[last_node] = cand
-                continue
-            end
-            old = best_by_node[last_node]
-            if cand.score < old.score - 1e-9 || (abs(cand.score - old.score) <= 1e-9 && cand.g < old.g - 1e-9)
-                best_by_node[last_node] = cand
-            end
-        end
-
-        frontier = collect(values(best_by_node))
-        sort!(frontier, by = s -> (s.score, s.g))
-        if length(frontier) > beam_width
-            frontier = frontier[1:beam_width]
-        end
-    end
-
-    if isempty(best_path)
-        if !isempty(best_goal_path)
-            return best_goal_path, best_goal_dist, best_goal_unc
-        end
-        return Int[], Inf, Inf
-    end
-    return best_path, best_dist, best_unc
-end
-
-function refine_support_paths_for_primary(graph::LandmarkGraph,
-                                          primary_path::Vector{Int},
-                                          primary_dist::Float64,
-                                          num_agents::Int;
-                                          max_support_iters::Int=3)
-    ns = max(num_agents - 1, 0)
-    support_paths = [Int[] for _ in 1:ns]
-
-    for _support_iter in 1:max_support_iters
-        changed = false
-        for sup_idx in 1:ns
-            other_paths = Vector{Vector{Int}}()
-            for j in 1:ns
-                j == sup_idx && continue
-                isempty(support_paths[j]) && continue
-                push!(other_paths, support_paths[j])
-            end
-
-            sup_path, _ = single_support_astar(graph, graph.landmarks, primary_path, primary_dist, other_paths, sup_idx)
-            new_path = isempty(sup_path) ? [1] : sup_path
-            if new_path != support_paths[sup_idx]
-                support_paths[sup_idx] = new_path
-                changed = true
-            end
-        end
-        !changed && break
-    end
-
-    return support_paths
-end
-
-# Build a feasible incumbent by alternating:
-#  1) beam-search primary solve under the uncertainty bound,
-#  2) iterative support optimization against that primary,
-#  3) primary re-solve with support effect modeled,
-# until primary path stabilizes.
-function build_joint_incumbent_seed(graph::LandmarkGraph,
-                                    lms::Vector{Landmark},
-                                    unc_threshold::Float64,
-                                    num_agents::Int;
-                                    max_outer_iters::Int=8,
-                                    beam_width::Int=24,
-                                    support_max_expansions::Int=200000)
-    na = num_agents
-    primary = na
-
-    best_paths = nothing
-    best_dists = nothing
-    best_unc = Inf
-    best_dist = Inf
-
-    seed_start_t = time()
-
-    # Initial primary plan uses beam search and an optimistic support model.
-    prim_path, prim_dist, prim_unc = Int[], Inf, Inf
-    for current_beam_width in (beam_width, beam_width * 2, beam_width * 4)
-        prim_path, prim_dist, prim_unc = beam_primary_uncertainty_seed(
-            graph, lms, unc_threshold, na;
-            beam_width=current_beam_width,
-            modeled_support_paths=nothing
-        )
-        !isempty(prim_path) && break
-    end
-    if isempty(prim_path)
-        println("    [Warm-start] beam-search primary solve found no goal-reaching path")
-        println("    [Warm-start] complete in $(round(time() - seed_start_t, digits=2))s")
-        return nothing
-    end
-    if prim_unc > unc_threshold
-        println("    [Warm-start] initial beam primary is not yet feasible; optimizing supports and re-planning")
-    end
-
-    prev_primary = Int[]
-    for outer in 1:max_outer_iters
-        println("    [Warm-start] iter=$outer primary_dist=$(round(prim_dist, digits=3)) primary_unc=$(round(prim_unc, digits=4))")
-
-        # Step 2: optimize all support agents against the fixed primary path.
-        support_paths, support_unc = support_astar(
-            graph, lms, prim_path, prim_dist, unc_threshold, na - 1;
-            max_expansions=support_max_expansions
-        )
-        println("    [Warm-start] support refine unc=$(round(support_unc, digits=4))")
-
-        # Evaluate current alternating iterate.
-        full_paths = vcat(support_paths, [prim_path])
-        final_covs, final_dists = evaluate_full_paths(full_paths, graph, lms, na)
-        cur_unc = unc_radius(final_covs[primary])
-        cur_dist = final_dists[primary]
-
-        if cur_unc <= unc_threshold && cur_dist < best_dist - 1e-9
-            best_paths = full_paths
-            best_dists = final_dists
-            best_unc = cur_unc
-            best_dist = cur_dist
-            println("    [Warm-start] feasible dist=$(round(cur_dist, digits=3)) unc=$(round(cur_unc, digits=4))")
-        end
-
-        # Step 3: re-plan primary with support effect modeled.
-        new_prim_path, new_prim_dist, new_prim_unc = beam_primary_uncertainty_seed(
-            graph, lms, unc_threshold, na;
-            modeled_support_paths=support_paths,
-            beam_width=beam_width
-        )
-
-        if isempty(new_prim_path)
-            println("    [Warm-start] replan primary produced no feasible path; keep best-so-far")
-            break
-        end
-
-        # Converged if path does not change.
-        if new_prim_path == prim_path || new_prim_path == prev_primary
-            prim_path, prim_dist, prim_unc = new_prim_path, new_prim_dist, new_prim_unc
-            break
-        end
-
-        prev_primary = prim_path
-        prim_path, prim_dist, prim_unc = new_prim_path, new_prim_dist, new_prim_unc
-    end
-
-    println("    [Warm-start] complete in $(round(time() - seed_start_t, digits=2))s")
-    best_paths === nothing && return nothing
-    return (best_paths, best_dists, best_unc)
-end
-
-function plot_warm_start_solution(graph::LandmarkGraph,
-                                  lms::Vector{Landmark},
-                                  seed_paths::Vector{Vector{Int}},
-                                  seed_dists::Vector{Float64},
-                                  seed_unc::Float64;
-                                  filename::String="fig2_warm_start.png")
-    local_colors = [:purple, :teal, :darkorange, :crimson, :magenta,
-                    :brown, :lime, :navy, :coral, :olive]
-    _, sensor_mask = node_role_masks(graph)
-    plt = plot(legend=:outerright, aspect_ratio=:equal,
-               xlabel="x (m)", ylabel="y (m)",
-               title="Fig 2: Warm-start [len=$(round(seed_dists[end], digits=2)), unc=$(round(seed_unc, digits=3))]")
-
-    draw_hex_tiles!(plt, graph; fill_color=:aliceblue, line_color=:cadetblue,
-                    fill_alpha=0.98, line_alpha=1.0)
-
-    sensor_idx = findall(sensor_mask)
-    if !isempty(sensor_idx)
-        lx = [graph.landmarks[i].x for i in sensor_idx]
-        ly = [graph.landmarks[i].y for i in sensor_idx]
-        scatter!(plt, lx, ly, label="Landmarks", color=:black, markersize=4,
-                 markerstrokewidth=0)
-        for i in sensor_idx
-            draw_covariance_ellipse!(plt, graph.landmarks[i].x, graph.landmarks[i].y,
-                                     graph.landmarks[i].cov, color=:red, alpha=0.22,
-                                     display_scale=400.0)
-        end
-    end
-
-    for (ai, path) in enumerate(seed_paths)
-        isempty(path) && continue
-        px = [graph.landmarks[j].x for j in path]
-        py = [graph.landmarks[j].y for j in path]
-        is_primary = (ai == length(seed_paths))
-        clr = is_primary ? :blue : get(local_colors, ai, :gray)
-        lbl = is_primary ? "Primary (seed)" : "Support $ai (seed)"
-        ls = is_primary ? :solid : (ai == 1 ? :dash : (ai == 2 ? :dashdot : :dot))
-        lw = is_primary ? 2.0 : 1.2
-        plot!(plt, px, py, label=lbl, color=clr, linewidth=lw, linestyle=ls)
-    end
-
-    # Make the warm-start's effect on the primary uncertainty visible on the plot.
-    if !isempty(seed_paths)
-        seed_xs = Vector{Vector{Float64}}(undef, length(seed_paths))
-        seed_ys = Vector{Vector{Float64}}(undef, length(seed_paths))
-        for ai in 1:length(seed_paths)
-            seed_xs[ai] = [graph.landmarks[j].x for j in seed_paths[ai]]
-            seed_ys[ai] = [graph.landmarks[j].y for j in seed_paths[ai]]
-        end
-        seed_positions = xs_ys_to_positions(seed_xs, seed_ys)
-        seed_cov_traj, _ = evaluate_joint_discrete(seed_positions, lms, length(seed_paths))
-        prim_covs = seed_cov_traj[end]
-        prim_path = seed_paths[end]
-        prim_xs = [graph.landmarks[j].x for j in prim_path]
-        prim_ys = [graph.landmarks[j].y for j in prim_path]
-        for k in 1:min(length(prim_covs), length(prim_xs), length(prim_ys))
-            draw_covariance_ellipse!(plt, prim_xs[k], prim_ys[k], prim_covs[k];
-                                     nstd=2, color=:blue, alpha=0.10)
-        end
-    end
-
-    scatter!(plt, [graph.landmarks[1].x], [graph.landmarks[1].y],
-             color=:green, markersize=8, markerstrokewidth=0, label="Start")
-    scatter!(plt, [graph.landmarks[graph.n].x], [graph.landmarks[graph.n].y],
-             color=:orange, marker=:star5, markersize=10, markerstrokewidth=0,
-             label="Goal")
-
-    set_hex_world_limits!(plt, graph)
-    savefig(plt, filename)
-    display(plt)
-    println("  Warm-start figure saved: $filename")
-end
-
 # ------------------------------------------------------------------
 # Constraint-Aware A* Search
 # ------------------------------------------------------------------
@@ -2308,17 +1080,16 @@ end
 #   - EPSILON-BOUND ORDERING: primary key is weighted f=g+(1+ε)h using
 #     primary shortest-path heuristic; tie-breakers prefer low uncertainty
 #     and non-idle supports
-#   - BEST-INCUMBENT PRUNING: aggressively skip states where
-#     f > best_feasible_dist
 #   - SUPPORT CAP: supports cannot exceed primary's arc-distance
+#   - COMM RADIUS GATE: supports must stay within direct comm range of the primary
+#   - PRIMARY UNCERTAINTY GATE: prune any state whose primary uncertainty exceeds
+#     the threshold immediately, rather than allowing later recovery
 #   - EARLY STOPPING: return once feasible solution found
 #
 # How it works:
 #   1. Use optimistic lower-bound distances for f-value computation
-#   2. Skip expensive evaluation if f_optimistic >= best_feasible
-#   3. Only evaluate full B-spline paths when necessary
-#   4. Track best feasible solution globally
-#   5. Continue exploring for optimality proof
+#   2. Expand the OPEN list in A* order
+#   3. Return immediately when the first feasible goal is popped
 #
 function joint_astar(graph::LandmarkGraph,
                      lms::Vector{Landmark},
@@ -2351,8 +1122,6 @@ function joint_astar(graph::LandmarkGraph,
         h0 = graph.shortest_paths[1, goal]
         enqueue!(pq_sa, 1, (w_astar * h0, unc_radius(states_sa[1].cov)))
 
-        best_goal_si = 0
-        best_goal_dist = Inf
         iter_count_sa = 0
 
         # Node-level Pareto frontier with SOUND covariance dominance.
@@ -2366,18 +1135,30 @@ function joint_astar(graph::LandmarkGraph,
             S = states_sa[si]
             iter_count_sa += 1
 
-            h = graph.shortest_paths[S.node, goal]
-            f = S.dist + w_astar * h
-            if isfinite(best_goal_dist) && f >= best_goal_dist
+            popped_unc = unc_radius(S.cov)
+            if PRUNE_BY_PRIMARY_UNCERTAINTY && unc_exceeds_threshold(popped_unc, unc_threshold)
+                println("  [Constraint A*] Pruned state at iter $iter_count_sa: node=$(S.node), primary_unc=$(round(popped_unc, digits=4)) > threshold=$(round(unc_threshold, digits=4))")
                 continue
             end
 
+            h = graph.shortest_paths[S.node, goal]
             if S.node == goal
-                gu = unc_radius(S.cov)
-                if gu <= unc_threshold && S.dist < best_goal_dist
-                    best_goal_dist = S.dist
-                    best_goal_si = si
+                path = Int[]
+                psi = si
+                while psi != -1
+                    pushfirst!(path, states_sa[psi].node)
+                    psi = states_sa[psi].parent
                 end
+
+                exact_covs, exact_dists = evaluate_full_paths([path], graph, lms, 1)
+                exact_unc = unc_radius(exact_covs[1])
+                if unc_within_threshold(exact_unc, unc_threshold)
+                    println("  ✓ FEASIBLE SOLUTION at iter $iter_count_sa: dist=$(round(exact_dists[1], digits=3)), unc=$(round(exact_unc, digits=4))")
+                    println("  [Constraint A*] Single-agent complete: $(iter_count_sa) iterations, final_dist=$(round(exact_dists[1], digits=3))")
+                    return [path], [exact_dists[1]], exact_unc
+                end
+
+                println("  [Constraint A*] Goal popped but infeasible under exact eval: unc=$(round(exact_unc, digits=4))")
                 continue
             end
 
@@ -2420,27 +1201,12 @@ function joint_astar(graph::LandmarkGraph,
                 nsi = length(states_sa)
                 nh = graph.shortest_paths[u, goal]
                 nf = nd + w_astar * nh
-                if isfinite(best_goal_dist) && nf >= best_goal_dist
-                    continue
-                end
                 enqueue!(pq_sa, nsi, (nf, nunc))
             end
         end
 
-        if best_goal_si == 0
-            println("  [Constraint A*] No feasible single-agent solution found")
-            return [Int[]], [0.0], Inf
-        end
-
-        path = Int[]
-        si = best_goal_si
-        while si != -1
-            pushfirst!(path, states_sa[si].node)
-            si = states_sa[si].parent
-        end
-
-        println("  [Constraint A*] Single-agent complete: $(iter_count_sa) iterations, final_dist=$(round(best_goal_dist, digits=3))")
-        return [path], [best_goal_dist], unc_radius(states_sa[best_goal_si].cov)
+        println("  [Constraint A*] No feasible single-agent solution found")
+        return [Int[]], [0.0], Inf
     end
 
     # ── Initial state: all agents at node 1 (start) ──────────────────────────
@@ -2465,34 +1231,7 @@ function joint_astar(graph::LandmarkGraph,
     init_unc = unc_radius(init_covs[primary])
     enqueue!(pq, 1, (init_f, init_unc, support_idle_score(init_dists)))
 
-    best_feasible_dist = Inf
-    best_feasible_si   = 0
     iter_count         = 0
-
-    # Safe incumbent seeding: only sets an upper bound (never removes optimality).
-    if seed_paths !== nothing
-        if length(seed_paths) == na && !isempty(seed_paths[primary]) && seed_paths[primary][end] == goal
-            seed_covs, seed_eval_dists = evaluate_full_paths(seed_paths, graph, lms, na)
-            seed_unc = unc_radius(seed_covs[primary])
-            if seed_unc <= unc_threshold
-                seed_use_dists = seed_dists === nothing ? seed_eval_dists : seed_dists
-                push!(states, JointState([copy(seed_paths[a]) for a in 1:na],
-                                          seed_covs,
-                                          copy(seed_use_dists),
-                                          seed_use_dists[primary],
-                                          -1,
-                                          [falses(n) for _ in 1:na]))
-                best_feasible_si = length(states)
-                best_feasible_dist = seed_use_dists[primary]
-                exact_state_best[joint_path_key(seed_paths)] = best_feasible_si
-                println("  ✓ Seed incumbent: dist=$(round(best_feasible_dist, digits=3)), unc=$(round(seed_unc, digits=4))")
-            else
-                println("  [Seed] Infeasible seed rejected: unc=$(round(seed_unc, digits=4))")
-            end
-        else
-            println("  [Seed] Invalid seed shape or primary goal not reached; ignored.")
-        end
-    end
 
     # Safe dominance frontier keyed by (joint nodes, exact visited signature).
     # This only compares states with identical future action sets.
@@ -2556,7 +1295,7 @@ function joint_astar(graph::LandmarkGraph,
 
         prim_node = isempty(state.paths[primary]) ? 0 : state.paths[primary][end]
         prim_h = isinf(graph.shortest_paths[prim_node, goal]) ? "∞" : "$(round(graph.shortest_paths[prim_node, goal], digits=1))"
-        ann = "Iter $iter_no, prim_node=$prim_node, h=$prim_h, best_dist=$(round(best_feasible_dist, digits=3))"
+        ann = "Iter $iter_no, prim_node=$prim_node, h=$prim_h"
         annotate!(plt, (graph.landmarks[1].x, graph.landmarks[1].y + 100), text(ann, :black, 10))
         return plt
     end
@@ -2566,10 +1305,16 @@ function joint_astar(graph::LandmarkGraph,
         S   = states[si]
         iter_count += 1
 
+        popped_unc = unc_radius(S.covs[primary])
+        if PRUNE_BY_PRIMARY_UNCERTAINTY && unc_exceeds_threshold(popped_unc, unc_threshold)
+            println("  [Constraint A*] Pruned joint state at iter $iter_count: primary_unc=$(round(popped_unc, digits=4)) > threshold=$(round(unc_threshold, digits=4))")
+            continue
+        end
+
         # --- Animation: plot only the requested iteration window, sampled sparsely ---
         if animate_enabled && iter_count >= animate_start_iter && iter_count <= animate_start_iter + animate_limit - 1 &&
            mod(iter_count - animate_start_iter, animate_sample_period) == 0
-            plt = debug_joint_astar_plot(S, best_feasible_si, iter_count)
+            plt = debug_joint_astar_plot(S, 0, iter_count)
             frame(anim_frames, plt)
         end
 
@@ -2585,27 +1330,30 @@ function joint_astar(graph::LandmarkGraph,
             end
         end
 
-        # Progress update every 500 iterations
-        if mod(iter_count, 500) == 0
+        # Progress update early; when animation is enabled, match the console cadence
+        # to the animation sampling period so logs align with plotted frames.
+        progress_every = animate_enabled ? animate_sample_period : 100
+        if iter_count <= 5 || mod(iter_count, progress_every) == 0
             prim_node = isempty(S.paths[primary]) ? 0 : S.paths[primary][end]
             prim_h = isinf(graph.shortest_paths[prim_node, goal]) ? "∞" : "$(round(graph.shortest_paths[prim_node, goal], digits=1))"
-            println("  [Constraint A*] Iter $iter_count, prim_node=$prim_node, h=$prim_h, feasible=$(isfinite(best_feasible_dist) ? "✓" : "✗"), best_dist=$(round(best_feasible_dist, digits=3)), queue_size=$(length(pq))")
+            println("  [Constraint A*] Iter $iter_count, prim_node=$prim_node, h=$prim_h, queue_size=$(length(pq))")
         end
 
-        # Basic pruning: if this state's f-value exceeds best feasible, skip it
+        # Standard A* ordering uses f only for priority; no incumbent pruning.
         h = joint_heuristic(S.paths, goal, graph)
         f = S.g + w_astar * h
-        if isfinite(best_feasible_dist) && f >= best_feasible_dist
-            continue
-        end
 
         # Check if primary reached goal
         if S.paths[primary][end] == goal
-            prim_unc = unc_radius(S.covs[primary])
-            if prim_unc <= unc_threshold && S.g < best_feasible_dist
-                best_feasible_dist = S.g
-                best_feasible_si = si
-                println("  ✓ FEASIBLE SOLUTION at iter $iter_count: dist=$(round(S.g, digits=3)), unc=$(round(prim_unc, digits=4))")
+            agent_paths = [copy(S.paths[a]) for a in 1:na]
+            exact_covs, exact_dists = evaluate_full_paths(agent_paths, graph, lms, na)
+            exact_unc = unc_radius(exact_covs[primary])
+            if unc_within_threshold(exact_unc, unc_threshold)
+                println("  ✓ FEASIBLE SOLUTION at iter $iter_count: dist=$(round(exact_dists[primary], digits=3)), unc=$(round(exact_unc, digits=4))")
+                println("  [Constraint A*] Complete: $(iter_count) iterations, final_dist=$(round(exact_dists[primary], digits=3))")
+                return agent_paths, exact_dists, exact_unc
+            else
+                println("  [Constraint A*] Goal popped but infeasible under exact eval: unc=$(round(exact_unc, digits=4)) > $(round(unc_threshold, digits=4))")
             end
             continue
         end
@@ -2642,14 +1390,30 @@ function joint_astar(graph::LandmarkGraph,
                     new_dists[a] > new_dists[primary] && return
                 end
 
+                if PRUNE_BY_COMM_RADIUS_JOINT
+                    supports_within_comm_radius(candidate_nodes, graph, primary) || return
+                end
+
                 new_covs = apply_joint_step_comms(new_covs, candidate_nodes, new_dists, graph)
                 new_g = new_dists[primary]
-                new_h = joint_heuristic(new_paths, goal, graph)
-                f_exact = new_g + w_astar * new_h
 
-                if isfinite(best_feasible_dist) && f_exact >= best_feasible_dist
+                # Support agents must also remain under the uncertainty threshold.
+                for a in 1:(primary - 1)
+                    sup_unc = unc_radius(new_covs[a])
+                    if PRUNE_BY_SUPPORT_UNCERTAINTY && unc_exceeds_threshold(sup_unc, unc_threshold)
+                        # println("  [Constraint A*] Pruned expansion: support $a unc=$(round(sup_unc, digits=4)) > threshold=$(round(unc_threshold, digits=4))")
+                        return
+                    end
+                end
+
+                prim_unc = unc_radius(new_covs[primary])
+                if PRUNE_BY_PRIMARY_UNCERTAINTY && unc_exceeds_threshold(prim_unc, unc_threshold)
+                    # println("  [Constraint A*] Pruned expansion: primary_unc=$(round(prim_unc, digits=4)) > threshold=$(round(unc_threshold, digits=4))")
                     return
                 end
+
+                new_h = joint_heuristic(new_paths, goal, graph)
+                f_exact = new_g + w_astar * new_h
 
                 sig_key = (joint_node_key(new_paths), joint_visited_key(new_visited))
                 labels = get(frontier_by_signature, sig_key, Tuple{Float64, Matrix{Float64}}[])
@@ -2673,20 +1437,7 @@ function joint_astar(graph::LandmarkGraph,
                     return
                 end
 
-                if new_paths[primary][end] == goal
-                    prim_unc = unc_radius(new_covs[primary])
-                    if prim_unc <= unc_threshold && new_g < best_feasible_dist
-                        push!(states, JointState(copy(new_paths), new_covs, new_dists,
-                                                  new_g, si, new_visited))
-                        best_feasible_si = length(states)
-                        best_feasible_dist = new_g
-                        exact_state_best[new_path_key] = best_feasible_si
-                        println("  ✓ FEASIBLE at iter $iter_count: dist=$(round(new_g, digits=3)), unc=$(round(prim_unc, digits=4))")
-                    end
-                    return
-                end
-
-                prim_unc_key = unc_radius(new_covs[primary])
+                prim_unc_key = prim_unc
                 push!(states, JointState(copy(new_paths), new_covs, new_dists,
                                           new_g, si, new_visited))
                 new_si = length(states)
@@ -2704,9 +1455,6 @@ function joint_astar(graph::LandmarkGraph,
                 if agent == primary
                     primary_dist_next = S.dists[primary] + graph.distance[curr_node, u]
                     primary_h_next = graph.shortest_paths[u, goal]
-                    if isfinite(best_feasible_dist) && primary_dist_next + w_astar * primary_h_next >= best_feasible_dist
-                        continue
-                    end
                     expand_joint_moves(agent_idx + 1, primary_dist_next)
                 else
                     support_dist_next = S.dists[agent] + graph.distance[curr_node, u]
@@ -2724,42 +1472,31 @@ function joint_astar(graph::LandmarkGraph,
         println("  [Constraint A*] Animation saved to $debug_gif_path (iters $(animate_start_iter)-$(min(iter_count, animate_start_iter + animate_limit - 1)))")
     end
 
-    # ── Extract final solution ────────────────────────────────────────────────
-    if best_feasible_si == 0
-        println("  [Constraint A*] No feasible solution found")
-        return [Int[] for _ in 1:na], zeros(na), Inf
-    end
-
-    final = states[best_feasible_si]
-    agent_paths = [copy(final.paths[a]) for a in 1:na]
-    path_dists = copy(final.dists)
-
-    println("  [Constraint A*] Complete: $(iter_count) iterations, final_dist=$(round(final.g, digits=3))")
-    return agent_paths, path_dists, unc_radius(final.covs[primary])
+    # ── No feasible goal reached ──────────────────────────────────────────────
+    println("  [Constraint A*] No feasible solution found")
+    return [Int[] for _ in 1:na], zeros(na), Inf
 end
 
 # ==========================================================================
-# Top-level planner: Comprehensive A* Search + Support Optimization
+# Top-level planner: Joint discrete A* -> continuous refinement
 # ==========================================================================
-# Search for shortest feasible path using A*, optimizing supports for each candidate path.
+# Search for a feasible joint discrete seed first, then refine it continuously.
 # Returns (paths, dists, uncs, base_gcov, shortest_path, shortest_dist,
 #          goal_unc, expansions)
-
-struct PrimaryPathState
-    node::Int
-    path::Vector{Int}
-    dist::Float64
-    parent::Int  # index in states vector
-    cov::Matrix{Float64}
-end
 
 function multi_agent_usp(graph::LandmarkGraph,
                           unc_threshold::Float64,
                           num_ag::Int = 1;
-                          binary_search_tol::Float64 = 0.5)  # unused, kept for compat
-    n        = graph.n
+                          lms::Vector{Landmark}=graph.landmarks,
+                          binary_search_tol::Float64 = 0.5,  # unused, kept for compat
+                          debug_animate::Bool=false,
+                          debug_animate_start_iter::Int=1,
+                          debug_animate_iters::Int=1000,
+                          debug_animate_sample_period::Int=1,
+                          debug_stop_after_animate::Bool=true,
+                          debug_gif_path::String="fig_astar_partial.gif")
+    n         = graph.n
     base_gcov = [copy(graph.landmarks[i].cov) for i in 1:n]
-    lms_base  = graph.landmarks  # Use full landmark list from graph
 
     # ── Connectivity / distance-only reference ─────────────────────────────
     shortest_path, shortest_dist = search_shortest_path(graph)
@@ -2770,211 +1507,31 @@ function multi_agent_usp(graph::LandmarkGraph,
     println("Shortest (distance-only) path: ", shortest_path,
             "  dist=", round(shortest_dist, digits=3))
 
-    # ── Two-Phase Planning: single-agent A* incumbent + support refinement ─
-    # Phase 1: Solve a single-agent uncertainty-constrained primary path.
-    # Phase 2: Refine supports against that primary, then replan the primary
-    #          with support effect modeled until the primary path stabilizes.
-    
-    println("\n── Lexicographic ε-A* Search: distance-first, information-aware tie-break ──")
-    println("Using ε=$(PRIMARY_EPSILON): primary key is f=g+(1+ε)h; secondary key prioritizes higher information states.")
-    
-    goal = graph.n
-    states = PrimaryPathState[]
-    
-    # Initial state: start at node 1
-    init_state = PrimaryPathState(1, [1], 0.0, -1, copy(lms_base[1].cov))
-    push!(states, init_state)
-    
-    # Priority queue: (state_index, f_value) where f = g + (1+ε)×h
-    # h = Euclidean distance to goal
-    h(node::Int) = hypot(graph.landmarks[node].x - graph.landmarks[goal].x,
-                         graph.landmarks[node].y - graph.landmarks[goal].y)
-    
-    goal_x = graph.landmarks[goal].x
-    goal_y = graph.landmarks[goal].y
+    println("\n── Joint discrete A* -> continuous refinement ──")
+    println("Searching joint discrete paths first, then refining the result with the continuous optimizer.")
 
-    function posterior_unc_from_info(prior_cov::Matrix{Float64}, I11::Float64, I12::Float64, I22::Float64)
-        det_c = prior_cov[1,1]*prior_cov[2,2] - prior_cov[1,2]*prior_cov[2,1]
-        abs(det_c) < 1e-20 && return unc_radius(prior_cov)
-        inv_det = 1.0 / det_c
-        J11 = I11 + prior_cov[2,2]*inv_det
-        J12 = I12 - prior_cov[1,2]*inv_det
-        J22 = I22 + prior_cov[1,1]*inv_det
-        det_j = J11*J22 - J12*J12
-        abs(det_j) < 1e-20 && return unc_radius(prior_cov)
-        inv_dj = 1.0 / det_j
-        post_cov = [J22*inv_dj  -J12*inv_dj; -J12*inv_dj  J11*inv_dj]
-        return unc_radius(post_cov)
-    end
+    joint_paths, joint_dists, joint_unc = joint_astar(
+        graph, lms, unc_threshold, num_ag;
+        debug_animate=debug_animate,
+        debug_animate_start_iter=debug_animate_start_iter,
+        debug_animate_iters=debug_animate_iters,
+        debug_animate_sample_period=debug_animate_sample_period,
+        debug_stop_after_animate=debug_stop_after_animate,
+        debug_gif_path=debug_gif_path
+    )
 
-    # Precompute static information score at each node for fast lexicographic tie-breaks.
-    node_info_score = zeros(Float64, n)
-    for node in 1:n
-        x = graph.landmarks[node].x
-        y = graph.landmarks[node].y
-        I11 = 0.0; I12 = 0.0; I22 = 0.0
-        for lm in lms_base
-            info = landmark_info(x, y, lm)
-            info === nothing && continue
-            I11 += info[1]; I12 += info[2]; I22 += info[3]
-        end
-        post_unc = posterior_unc_from_info(graph.landmarks[node].cov, I11, I12, I22)
-        node_info_score[node] = 1.0 / (post_unc + 1e-9)
-    end
-
-    # Conservative lower bound on achievable goal uncertainty from current belief:
-    # assume zero process noise from now and immediate goal-landmark fusion.
-    goal_I11 = 0.0; goal_I12 = 0.0; goal_I22 = 0.0
-    for lm in lms_base
-        info = landmark_info(goal_x, goal_y, lm)
-        info === nothing && continue
-        goal_I11 += info[1]; goal_I12 += info[2]; goal_I22 += info[3]
-    end
-
-    # Lexicographic key: (primary f-cost, -information_score)
-    pq = PriorityQueue{Int, Tuple{Float64, Float64}}()
-    init_f = init_state.dist + (1.0 + PRIMARY_EPSILON) * h(1)
-    init_info = node_info_score[1]
-    enqueue!(pq, 1, (init_f, -init_info))
-    
-    # Track Pareto frontier at each node: (distance, uncertainty) pairs.
-    # A new arrival is dominated if existing state has <= distance AND <= uncertainty.
-    # This prunes multi-objective dominated states while preserving Pareto optimality.
-    frontier_at_node = Dict{Int, Vector{Tuple{Float64, Float64}}}
-    frontier_at_node = Dict()
-    frontier_at_node[1] = [(0.0, unc_radius(init_state.cov))]
-    
-    visited_goal = 0  # index of first state reaching goal with feasible uncertainty
-    feasible_paths = []  # kept for reporting compatibility
-    expansion_count = 0
-    prune_count = 0
-    
-    while !isempty(pq)
-        state_idx = dequeue!(pq)
-        S = states[state_idx]
-        expansion_count += 1
-        
-        # AGGRESSIVE INTERMEDIATE PRUNING: skip states where primary uncertainty 
-        # already exceeds threshold. This eliminates entire branches early.
-        if unc_radius(S.cov) > unc_threshold
-            prune_count += 1
-            continue
-        end
-        
-        # Progress update
-        if mod(expansion_count, 1000) == 0
-            println("  [A* Primary] Expanded $expansion_count states, queue_size=$(length(pq)), best_feasible=$(length(feasible_paths) > 0 ? "✓ ($(length(feasible_paths)) found)" : "✗")")
-        end
-        
-        # Check if we reached goal
-        if S.node == goal
-            # Optimize supports to minimize uncertainty for this primary path
-            support_paths = Vector{Vector{Int}}(undef, num_ag - 1)
-            for sup_idx in 1:(num_ag - 1)
-                other_paths = vcat(support_paths[1:sup_idx-1])
-                sup_path, _ = single_support_astar(
-                    graph, lms_base, S.path, S.dist, other_paths, sup_idx
-                )
-                support_paths[sup_idx] = sup_path
-            end
-            
-            # Evaluate full joint paths
-            full_paths = vcat(support_paths, [S.path])
-            full_covs, full_dists = evaluate_full_paths(full_paths, graph, lms_base, num_ag)
-            actual_unc = unc_radius(full_covs[end])
-            
-            if actual_unc <= unc_threshold
-                println("    ✓ FEASIBLE #$(length(feasible_paths)+1) at expansion[$expansion_count]: dist=$(round(S.dist, digits=3)), unc=$(round(actual_unc, digits=4))")
-                push!(feasible_paths, (S.path, S.dist, full_paths, full_dists, full_covs, actual_unc))
-                if length(feasible_paths) == 1
-                    visited_goal = state_idx
-                end
-                # Weighted A*: return on first feasible goal popped from OPEN.
-                # This avoids post-hoc ranking among multiple goal states.
-                uncs = [unc_radius(full_covs[a]) for a in 1:num_ag]
-                println("A* search complete: explored $expansion_count states, pruned $prune_count states, first feasible goal popped.")
-                return full_paths, full_dists, uncs, base_gcov,
-                       shortest_path, shortest_dist, actual_unc, expansion_count
-            else
-                if mod(expansion_count, 500) == 0
-                    println("    ✗ Goal reached but infeasible: unc=$(round(actual_unc, digits=4)) > $(round(unc_threshold, digits=4))")
-                end
-            end
-            # Continue searching for more feasible paths
-            continue
-        end
-        
-        # Expand neighbors
-        for next_node in graph.neighbors[S.node]
-            # Skip if already in current path (cycle detection)
-            if next_node in S.path
-                continue
-            end
-            
-            edge_dist = graph.distance[S.node, next_node]
-            new_dist = S.dist + edge_dist
-            
-            new_path = vcat(S.path, next_node)
-            new_cov = edge_cov_continuous(S.node, next_node, graph, lms_base, S.cov)
-            new_unc = unc_radius(new_cov)
-            
-            # AGGRESSIVE INTERMEDIATE PRUNING: reject if already violates threshold.
-            # This eliminates entire subtrees of infeasible paths early.
-            if new_unc > unc_threshold
-                prune_count += 1
-                continue
-            end
-            
-            # MULTI-OBJECTIVE DOMINANCE PRUNING: skip if dominated by existing frontier at this node.
-            # A state is dominated if another state has distance <= new_dist AND uncertainty <= new_unc.
-            is_dominated = false
-            if haskey(frontier_at_node, next_node)
-                for (d, u) in frontier_at_node[next_node]
-                    if d <= new_dist + 1e-6 && u <= new_unc + 1e-6
-                        is_dominated = true
-                        prune_count += 1
-                        break
-                    end
-                end
-                if !is_dominated
-                    # Remove any frontier states now dominated by this new state
-                    new_frontier = filter(p -> !(new_dist <= p[1] + 1e-6 && new_unc <= p[2] + 1e-6), frontier_at_node[next_node])
-                    push!(new_frontier, (new_dist, new_unc))
-                    frontier_at_node[next_node] = new_frontier
-                end
-            else
-                frontier_at_node[next_node] = [(new_dist, new_unc)]
-            end
-            
-            if is_dominated
-                continue
-            end
-            
-            new_state = PrimaryPathState(next_node, new_path, new_dist, state_idx, new_cov)
-            push!(states, new_state)
-            
-            f_primary = new_dist + (1.0 + PRIMARY_EPSILON) * h(next_node)
-            info_score = node_info_score[next_node]
-            enqueue!(pq, length(states), (f_primary, -info_score))
-        end
-    end
-    
-    # Return best feasible solution found
-    if length(feasible_paths) > 0
-        best_path, best_dist, full_paths, full_dists, full_covs, actual_unc = feasible_paths[1]
-        println("A* search complete: explored $expansion_count states, pruned $prune_count states, found $(length(feasible_paths)) feasible path(s).")
-        println("  Feasible paths found:")
-        for (i, (ppath, pdist, _, _, _, punc)) in enumerate(feasible_paths)
-            println("    Path $i: dist=$(round(pdist, digits=3)), unc=$(round(punc, digits=4))")
-        end
-        uncs = [unc_radius(full_covs[a]) for a in 1:num_ag]
-        return full_paths, full_dists, uncs, base_gcov,
-               shortest_path, shortest_dist, actual_unc, expansion_count
-    else
-        println("IMPOSSIBLE: A* exhausted search space (expanded $expansion_count states, pruned $prune_count states) without finding feasible solution.")
+    if length(joint_paths) != num_ag || any(isempty, joint_paths)
+        println("  ✗ Joint discrete A* found no feasible joint path")
         return Vector{Int}[], Float64[], Float64[], base_gcov,
                shortest_path, shortest_dist, Inf, 0
     end
+
+    final_covs, final_dists = evaluate_full_paths(joint_paths, graph, lms, num_ag)
+    final_uncs = [unc_radius(final_covs[a]) for a in 1:num_ag]
+
+    println("  ✓ Joint discrete A* produced a feasible seed with goal_unc=$(round(final_uncs[end], digits=4))")
+    return joint_paths, final_dists, final_uncs, base_gcov,
+           shortest_path, shortest_dist, final_uncs[end], 1
 end
 
 
@@ -3038,8 +1595,9 @@ function build_hex_graph(sensor_landmarks::Vector{Landmark},
     ymin = min(start_pos[2], goal_pos[2])
     ymax = max(start_pos[2], goal_pos[2])
 
-    # Artificially expand y-extent to allow lateral planning and detours.
-    y_expansion = 120.0  # ±120m total, allowing landmark-seeking routes without O(n³) blowup
+    # Artificially expand y-extent to allow meaningful lateral planning detours.
+    # Wider corridor lets the planner reach off-axis landmark clusters.
+    y_expansion = 260.0
     ymin -= y_expansion
     ymax += y_expansion
 
@@ -3048,9 +1606,11 @@ function build_hex_graph(sensor_landmarks::Vector{Landmark},
 
     grid_w = max(3, Int(ceil((xmax - xmin) / hex_w)) + 1 + 2 * padding)
     grid_h = max(3, Int(ceil((ymax - ymin) / y_step)) + 1 + 2 * padding)
+    iseven(grid_h) && (grid_h += 1)
 
     x0 = xmin - padding * hex_w
-    y0 = ymin - padding * y_step - 0.5 * y_step  # Shift down by half hex height to center at y=0
+    # Center the hex rows around y=0 so the corridor is visually symmetric.
+    y0 = -0.5 * (grid_h - 1) * y_step
 
     cells = Tuple{Int,Int}[]
     centers = Dict{Tuple{Int,Int}, Tuple{Float64,Float64}}()
@@ -3084,7 +1644,7 @@ function build_hex_graph(sensor_landmarks::Vector{Landmark},
 
     start_cell = nearest_cell(start_pos)
     goal_cell = nearest_cell(goal_pos)
-    start_heading = nearest_heading_to_goal(centers[start_cell], centers[goal_cell])
+    start_heading = nearest_heading_to_goal(start_pos, goal_pos)
 
     # Enumerate heading-expanded routing states; force start state to index 1.
     route_states = Tuple{Tuple{Int,Int}, Int}[]  # ((gx,gy), heading0..5)
@@ -3118,7 +1678,7 @@ function build_hex_graph(sensor_landmarks::Vector{Landmark},
         all_lms[i] = Landmark(cx, cy, copy(null_cov))
     end
     # Start covariance should match the original start prior.
-    all_lms[1] = Landmark(all_lms[1].x, all_lms[1].y, copy(sensor_landmarks[1].cov))
+    all_lms[1] = Landmark(start_pos[1], start_pos[2], copy(sensor_landmarks[1].cov))
 
     # Sensor landmarks are appended as static observation sources (not routing nodes).
     sensor_offset = n_route
@@ -3127,8 +1687,7 @@ function build_hex_graph(sensor_landmarks::Vector{Landmark},
     end
 
     # Terminal goal node (routing only)
-    gx, gy = centers[goal_cell]
-    all_lms[goal_idx] = Landmark(gx, gy, copy(null_cov))
+    all_lms[goal_idx] = Landmark(goal_pos[1], goal_pos[2], copy(null_cov))
 
     neighbors = [Int[] for _ in 1:n_total]
 
@@ -3252,9 +1811,9 @@ end
 
 function random_landmark_cov()
     # SPD covariance with randomized anisotropy/correlation.
-    sx = 0.95 + 0.55 * rand()
-    sy = 0.55 + 0.45 * rand()
-    ρ = 0.35 * (2 * rand() - 1)
+    sx = 0.80 + 0.55 * rand()
+    sy = 0.60 + 0.35 * rand()
+    ρ = 0.45 * (2 * rand() - 1)
     cxy = ρ * sx * sy
     return [sx^2 cxy; cxy sy^2]
 end
@@ -3262,42 +1821,15 @@ end
 function make_scattered_landmarks(start_pos::Tuple{Float64,Float64},
                                   goal_pos::Tuple{Float64,Float64};
                                   n_scatter::Int = 8)
-    sx, _ = start_pos
-    gx, _ = goal_pos
-    # Evenly dispersed landmarks: stratify in x and place in balanced top/bottom bands.
-    # This keeps landmarks away from the start-goal row (y=0) while covering the map.
-    x_min = sx + 55.0
-    x_max = gx - 55.0
-    y_band_min = 70.0
-    y_band_max = 220.0
+    _ = start_pos
+    _ = goal_pos
+    _ = n_scatter
 
-    cols = max(1, Int(ceil(n_scatter / 2)))
-    x_bins = range(x_min, x_max, length=cols + 1)
-
-    lms = Landmark[]
-    order = collect(1:cols)
-    shuffle!(order)
-
-    placed = 0
-    for c in order
-        x = x_bins[c] + rand() * (x_bins[c + 1] - x_bins[c])
-
-        if placed < n_scatter
-            y_top = y_band_min + rand() * (y_band_max - y_band_min)
-            push!(lms, Landmark(x, y_top, random_landmark_cov()))
-            placed += 1
-        end
-
-        if placed < n_scatter
-            y_bot = -(y_band_min + rand() * (y_band_max - y_band_min))
-            push!(lms, Landmark(x, y_bot, random_landmark_cov()))
-            placed += 1
-        end
-
-        placed >= n_scatter && break
-    end
-
-    return lms
+    # Fixed, simplified landmark layout requested by user.
+    return Landmark[
+        Landmark(800.0, 200.0, random_landmark_cov()),
+        Landmark(250.0, -200.0, random_landmark_cov())
+    ]
 end
 
 # Start and goal are plain routing waypoints — not landmarks, no covariance meaning.
@@ -3305,7 +1837,8 @@ end
 const START_POS = (0.0, 0.0)
 const GOAL_POS  = (1000.0, 0.0)
 
-# Randomized (seeded) sensor placement near the shortest path to induce detours.
+# Randomized (seeded) off-axis sensor placement so low-uncertainty plans deviate
+# from the geometric shortest path.
 landmarks = make_scattered_landmarks(START_POS, GOAL_POS)
 
 graph = build_hex_graph(landmarks, START_POS, GOAL_POS; hex_r=HEX_RADIUS_M)
@@ -3322,11 +1855,6 @@ w_astar = 1.0 + PRIMARY_EPSILON
 println("Conditional ε-bound: ε_sample=$(round(ε_sample, digits=4)), w=$(round(w_astar, digits=4)), ε_total=$(round(ε_total_conditional, digits=4))")
 println("  Bound form (conditional): L_returned ≤ (1+ε_total) L* with assumptions documented in comments.")
 
-n_landmarks  = length(landmarks)   # number of true landmarks (graph nodes 1..n_landmarks)
-x_coords     = [lm.x for lm in landmarks]
-y_coords     = [lm.y for lm in landmarks]
-marker_sizes = [sqrt(max_eigenvalue(lm.cov)) * MARKER_PROPORTION for lm in landmarks]
-
 function draw_covariance_ellipse!(plt, x, y, cov; npts=50, nstd=2, color=:red, alpha=0.3, display_scale=1.0)
     # display_scale is visualization-only (does not change estimation math)
     cov_vis = display_scale .* cov
@@ -3338,157 +1866,7 @@ function draw_covariance_ellipse!(plt, x, y, cov; npts=50, nstd=2, color=:red, a
     plot!(plt, x.+pts[1,:], y.+pts[2,:], seriestype=:shape, color=color, alpha=alpha, label=false)
 end
 
-# ------------------------------------------------------------------
-# Two-stage lexicographic planning helpers
-# Stage 1: choose information-gathering landmarks to meet uncertainty target.
-# Stage 2: compute shortest primary route constrained to visit selected nodes.
-# ------------------------------------------------------------------
-
-@inline function posterior_cov_from_info(prior_cov::Matrix{Float64}, I11::Float64, I12::Float64, I22::Float64)
-    det_c = prior_cov[1,1]*prior_cov[2,2] - prior_cov[1,2]*prior_cov[2,1]
-    abs(det_c) < 1e-20 && return copy(prior_cov)
-    inv_det = 1.0 / det_c
-    J11 = I11 + prior_cov[2,2]*inv_det
-    J12 = I12 - prior_cov[1,2]*inv_det
-    J22 = I22 + prior_cov[1,1]*inv_det
-    det_j = J11*J22 - J12*J12
-    abs(det_j) < 1e-20 && return copy(prior_cov)
-    inv_dj = 1.0 / det_j
-    return [J22*inv_dj  -J12*inv_dj; -J12*inv_dj  J11*inv_dj]
-end
-
-function select_info_landmarks(goal_x::Float64,
-                               goal_y::Float64,
-                               lms::Vector{Landmark},
-                               unc_threshold::Float64;
-                               max_visits::Int = 6,
-                               min_gain::Float64 = 1e-4)
-    n = length(lms)
-    selected = Int[]
-    chosen = falses(n)
-    prior_cov = copy(lms[1].cov)
-
-    I11 = 0.0; I12 = 0.0; I22 = 0.0
-    current_cov = posterior_cov_from_info(prior_cov, I11, I12, I22)
-    current_unc = unc_radius(current_cov)
-
-    while current_unc > unc_threshold && length(selected) < max_visits
-        best_idx = 0
-        best_unc = current_unc
-        best_info = (I11, I12, I22)
-
-        for i in 1:n
-            chosen[i] && continue
-            info = landmark_info(goal_x, goal_y, lms[i])
-            info === nothing && continue
-
-            tI11 = I11 + info[1]
-            tI12 = I12 + info[2]
-            tI22 = I22 + info[3]
-            test_cov = posterior_cov_from_info(prior_cov, tI11, tI12, tI22)
-            test_unc = unc_radius(test_cov)
-
-            if test_unc < best_unc
-                best_unc = test_unc
-                best_idx = i
-                best_info = (tI11, tI12, tI22)
-            end
-        end
-
-        if best_idx == 0 || (current_unc - best_unc) < min_gain
-            break
-        end
-
-        chosen[best_idx] = true
-        push!(selected, best_idx)
-        I11, I12, I22 = best_info
-        current_cov = posterior_cov_from_info(prior_cov, I11, I12, I22)
-        current_unc = best_unc
-    end
-
-    return selected, current_cov
-end
-
-function search_shortest_path_between(graph::LandmarkGraph, start::Int, goal::Int)
-    n = graph.n
-    dist = fill(Inf, n)
-    parent = fill(-1, n)
-    dist[start] = 0.0
-
-    gx = graph.landmarks[goal].x
-    gy = graph.landmarks[goal].y
-    h(v::Int) = hypot(graph.landmarks[v].x - gx, graph.landmarks[v].y - gy)
-
-    pq = PriorityQueue{Int,Float64}()
-    enqueue!(pq, start, h(start))
-    while !isempty(pq)
-        v = dequeue!(pq)
-        v == goal && break
-        for u in graph.neighbors[v]
-            nd = dist[v] + graph.distance[v, u]
-            if nd < dist[u]
-                dist[u] = nd
-                parent[u] = v
-                pq[u] = nd + h(u)
-            end
-        end
-    end
-
-    isinf(dist[goal]) && return Int[], Inf
-    path = Int[]
-    v = goal
-    while v != -1
-        push!(path, v)
-        v = parent[v]
-    end
-    return reverse!(path), dist[goal]
-end
-
-function shortest_path_with_visits(graph::LandmarkGraph, visits::Vector{Int})
-    length(visits) < 2 && return Int[], Inf
-    full_path = Int[]
-    total_dist = 0.0
-
-    for i in 1:(length(visits)-1)
-        seg, seg_dist = search_shortest_path_between(graph, visits[i], visits[i+1])
-        isempty(seg) && return Int[], Inf
-        if !isempty(full_path)
-            append!(full_path, seg[2:end])
-        else
-            append!(full_path, seg)
-        end
-        total_dist += seg_dist
-    end
-    return full_path, total_dist
-end
-
-function greedy_visit_order(graph::LandmarkGraph, start_node::Int, visit_nodes::Vector{Int})
-    remaining = copy(unique(visit_nodes))
-    order = Int[]
-    curr = start_node
-
-    while !isempty(remaining)
-        dists = [graph.shortest_paths[curr, v] for v in remaining]
-        j = argmin(dists)
-        next_node = remaining[j]
-        push!(order, next_node)
-        deleteat!(remaining, j)
-        curr = next_node
-    end
-    return order
-end
-
-
-# ----------------------
-# Two-stage lexicographic planner: info-gathering then optimal path
-# ----------------------
 goal_node = graph.n
-goal_x = graph.landmarks[goal_node].x
-goal_y = graph.landmarks[goal_node].y
-
-# Stage 1: select info-gathering landmarks
-selected_lms, info_cov = select_info_landmarks(goal_x, goal_y, graph.landmarks[1:n_landmarks], UNC_RADIUS_THRESHOLD)
-println("Selected info-gathering landmarks: ", selected_lms)
 
 # ────────────────────────────────────────────────────────────────────────────
 # MULTI-AGENT PLANNING: Sequential with Synchronized Kalman Fusion
@@ -3504,6 +1882,35 @@ println("Selected info-gathering landmarks: ", selected_lms)
 
 println("\n── MULTI-AGENT PLANNING (Synchronized Kalman) ──")
 seed = nothing
+disc_unc_threshold = effective_discrete_unc_threshold(UNC_RADIUS_THRESHOLD)
+if ENABLE_RELAXED_DISCRETE_FOR_CONTINUOUS && disc_unc_threshold > UNC_RADIUS_THRESHOLD + UNC_FEAS_TOL
+    println("  Discrete acceptance relaxed for continuous handoff: threshold=$(round(UNC_RADIUS_THRESHOLD, digits=4)) -> $(round(disc_unc_threshold, digits=4))")
+end
+
+function run_discrete_seed_search(search_unc_threshold::Float64)
+    println("\n  Running joint discrete A* seed search (threshold=$(round(search_unc_threshold, digits=4)))...")
+    joint_paths, joint_dists, _, _, _, _, _, _ = multi_agent_usp(
+        graph, search_unc_threshold, NUM_AGENTS;
+        lms=landmarks,
+        debug_animate=true,
+        debug_animate_start_iter=10000,
+        debug_animate_iters=300000,
+        debug_animate_sample_period=10000,
+        debug_stop_after_animate=false,
+        debug_gif_path="fig_joint_astar_progress.gif"
+    )
+
+    if !isempty(joint_paths)
+        println("  ✓ Found feasible joint discrete solution")
+        support_paths = pad_support_paths_to_primary(joint_paths[1:NUM_AGENTS-1], joint_paths[NUM_AGENTS])
+        primary_path = joint_paths[NUM_AGENTS]
+        primary_dist = joint_dists[NUM_AGENTS]
+        return support_paths, primary_path, primary_dist
+    end
+
+    println("  ✗ No feasible joint discrete solution found")
+    return [Int[] for _ in 1:(NUM_AGENTS - 1)], Int[], Inf
+end
 
 if PIPELINE_MODE == :straight_continuous
     println("\n  Mode=:straight_continuous — skipping discrete search and using direct start→goal seed")
@@ -3511,32 +1918,7 @@ if PIPELINE_MODE == :straight_continuous
     primary_dist = graph.distance[1, goal_node]
     support_paths = [Int[1, 1] for _ in 1:(NUM_AGENTS - 1)]
 elseif PIPELINE_MODE == :discrete_then_continuous
-    # Stage 1 + 2: Primary A* candidate enumeration + sequential support Dijkstra feasibility
-    println("\n  Enumerating primary A* paths until first support-feasible solution...")
-    joint_paths, joint_dists, joint_unc, candidate_count = first_feasible_primary_with_sequential_supports(
-        graph, graph.landmarks, UNC_RADIUS_THRESHOLD, NUM_AGENTS;
-        max_primary_expansions=1200000,
-        max_support_expansions=150000,
-        max_primary_candidates=5000,
-        debug_animate=DEBUG_SEQ_SEARCH_ANIMATE,
-        debug_gif_path=DEBUG_SEQ_SEARCH_GIF,
-        debug_primary_progress_every=DEBUG_SEQ_PRIMARY_PROGRESS_EVERY,
-        debug_support_progress_every=DEBUG_SEQ_SUPPORT_PROGRESS_EVERY,
-        debug_anim_primary_sample_every=DEBUG_SEQ_ANIM_PRIMARY_SAMPLE_EVERY,
-        debug_anim_support_sample_every=DEBUG_SEQ_ANIM_SUPPORT_SAMPLE_EVERY
-    )
-
-    if !isempty(joint_paths)
-        println("  ✓ Found feasible solution after $candidate_count primary candidates")
-        support_paths = pad_support_paths_to_primary(joint_paths[1:NUM_AGENTS-1], joint_paths[NUM_AGENTS])
-        primary_path = joint_paths[NUM_AGENTS]
-        primary_dist = joint_dists[NUM_AGENTS]
-    else
-        println("  ✗ No feasible solution found in configured candidate/expansion budget")
-        support_paths = [Int[] for _ in 1:(NUM_AGENTS - 1)]
-        primary_path = Int[]
-        primary_dist = Inf
-    end
+    support_paths, primary_path, primary_dist = run_discrete_seed_search(disc_unc_threshold)
 else
     error("Unsupported PIPELINE_MODE=$(PIPELINE_MODE). Use :discrete_then_continuous or :straight_continuous")
 end
@@ -3559,11 +1941,37 @@ else
     
     println("\n✓ Multi-agent solution with synchronized Kalman fusion:")
     for a in 1:(NUM_AGENTS-1)
-        println("  Support agent $a: dist=$(round(dists[a], digits=1))m, goal_unc=$(round(uncs[a], digits=4))m")
+        final_node = isempty(paths[a]) ? 0 : paths[a][end]
+        println("  Support agent $a: node=$(final_node), dist=$(round(dists[a], digits=1))m, goal_unc=$(round(uncs[a], digits=4))m")
     end
-    println("  Primary agent: dist=$(round(dists[end], digits=1))m, goal_unc=$(round(uncs[end], digits=4))m")
-    println("  ├─ Communication: every $(COMM_INTERVAL)m, Gaussian width σ=$(COMM_SIGMA)m")
+    primary_final_node = isempty(primary_path) ? 0 : primary_path[end]
+    println("  Primary agent: node=$(primary_final_node), dist=$(round(dists[end], digits=1))m, goal_unc=$(round(uncs[end], digits=4))m")
+    println("  ├─ Communication: every $(COMM_INTERVAL)m, Gaussian taper σ=$(COMM_SIGMA)m")
     println("  └─ All agents' uncertainties benefit from synchronized Kalman fusion at checkpoints")
+
+    if PIPELINE_MODE == :discrete_then_continuous && CONTINUE_ASTAR_ON_INFEASIBLE && unc_exceeds_threshold(solo_unc, disc_unc_threshold)
+        println("\n  Seed exceeded relaxed discrete threshold (goal_unc=$(round(solo_unc, digits=4)) > threshold=$(round(disc_unc_threshold, digits=4))).")
+        println("  Continuing A* under relaxed threshold...")
+        next_support_paths, next_primary_path, next_primary_dist = run_discrete_seed_search(disc_unc_threshold)
+
+        if isempty(next_primary_path)
+            println("  ✗ Relaxed-threshold A* did not find a feasible seed.")
+            paths = Vector{Vector{Int}}()
+            dists = Float64[]
+            uncs = Float64[]
+            final_global_cov = Matrix{Float64}[]
+            solo_unc = Inf
+        else
+            support_paths = next_support_paths
+            primary_path = next_primary_path
+            primary_dist = next_primary_dist
+            paths = vcat(support_paths, [primary_path])
+            final_global_cov, dists = evaluate_full_paths(paths, graph, landmarks, NUM_AGENTS)
+            uncs = [unc_radius(final_global_cov[a]) for a in 1:NUM_AGENTS]
+            solo_unc = uncs[end]
+            println("  ✓ Continued A* found relaxed-feasible seed: goal_unc=$(round(solo_unc, digits=4))")
+        end
+    end
 end
 
 shortest_path = primary_path
@@ -3578,13 +1986,13 @@ else
     for (i, path) in enumerate(paths[1:end-1])
         unc_status = ""
         if !isempty(path)
-            unc_threshold_ok = uncs[i] <= UNC_RADIUS_THRESHOLD ? "✓" : "✗"
+            unc_threshold_ok = unc_within_threshold(uncs[i]) ? "✓" : "✗"
             unc_status = "  goal_unc=$(round(uncs[i], digits=4))  $unc_threshold_ok"
         end
         isempty(path) ? println("Support agent $i : no path found") :
                         println("Support agent $i : ", path, "  dist=", round(dists[i], digits=3), unc_status, "  (Kalman-fused)")
     end
-    threshold_status = uncs[end] <= UNC_RADIUS_THRESHOLD ? "✓ met" : "✗ not met"
+    threshold_status = unc_within_threshold(uncs[end]) ? "✓ met" : "✗ not met"
     println("Primary agent : ", paths[end],
             "  dist=",     round(dists[end], digits=3),
             "  goal_unc=", round(uncs[end],  digits=4),
@@ -3596,7 +2004,7 @@ else
     println("  • Dead-reckoning propagation: DIR=$(DIR_UNCERTAINTY_PER_METER)/m, PERP=$(PERP_UNCERTAINTY_PER_METER)/m")
     println("  • Landmark fusion: Information filter (Joseph form) at every waypoint")
     println("  • SYNCHRONIZED inter-agent communication: every $(COMM_INTERVAL)m of travel")
-    println("  • Tapered Gaussian weighting: σ=$(COMM_SIGMA)m (100m ≈ 2σ transmission width)")
+    println("  • Tapered Gaussian weighting: σ=$(COMM_SIGMA)m (soft falloff over ~1-3σ)")
     println("  • Bidirectional Kalman fusion: all agent pairs within range at each checkpoint")
     println("  • Measurement model: bearing-angle sensor with noise=$(SENSOR_NOISE), ratio=$(BEARING_NOISE_RATIO)")
     println("  └─ Support agents: goal_unc=$(round(uncs[1], digits=4))m (improved by inter-agent fusion)")
@@ -3640,89 +2048,29 @@ function make_base_plot(landmarks, graph)
 end
 
 # ==========================================================================
-# Figure 0 — graph node connectivity
-# ==========================================================================
-let
-    route_mask, sensor_mask = node_role_masks(graph)
-    fig0_title = "Fig 0: Graph"
-    if seed !== nothing
-        fig0_title = "Fig 0: Graph [warm len=$(round(seed_dists[end], digits=2)), unc=$(round(seed_unc, digits=3))]"
-    end
-    plt0 = plot(legend=:outerright, aspect_ratio=:equal,
-                xlabel="x (m)", ylabel="y (m)",
-               title=fig0_title)
-
-    draw_hex_tiles!(plt0, graph; fill_color=:aliceblue, line_color=:cadetblue,
-                    fill_alpha=0.98, line_alpha=1.0)
-
-    # Draw edges (deduplicated: only draw i→j where i < j)
-    drawn = Set{Tuple{Int,Int}}()
-    goal_node = graph.n
-    for i in 1:graph.n
-        route_mask[i] || continue
-        xi = graph.landmarks[i].x; yi = graph.landmarks[i].y
-        for j in graph.neighbors[i]
-            route_mask[j] || continue
-            edge = (min(i,j), max(i,j))
-            edge in drawn && continue
-            push!(drawn, edge)
-            xj = graph.landmarks[j].x; yj = graph.landmarks[j].y
-            if i == goal_node || j == goal_node
-                clr = :orange; lw = 0.9; alpha = 0.6
-            else
-                clr = :steelblue; lw = 0.5; alpha = 0.30
-            end
-            plot!(plt0, [xi, xj], [yi, yj], color=clr, linewidth=lw, alpha=alpha, label=false)
-        end
-    end
-
-    # Sensor landmarks with covariance ellipses
-    sensor_idx = findall(sensor_mask)
-    for i in sensor_idx
-        draw_covariance_ellipse!(plt0, graph.landmarks[i].x, graph.landmarks[i].y, graph.landmarks[i].cov;
-                                  nstd=2, color=:red, alpha=0.18, display_scale=400.0)
-    end
-    if !isempty(sensor_idx)
-        lx = [graph.landmarks[i].x for i in sensor_idx]
-        ly = [graph.landmarks[i].y for i in sensor_idx]
-        scatter!(plt0, lx, ly, color=:black, markersize=5, markerstrokewidth=0, label="Landmark nodes")
-    end
-    scatter!(plt0, [graph.landmarks[1].x],     [graph.landmarks[1].y],     color=:green,  markersize=8,
-             markerstrokewidth=0, label="Start")
-    scatter!(plt0, [graph.landmarks[goal_node].x], [graph.landmarks[goal_node].y], color=:orange, marker=:star5,
-             markersize=9, markerstrokewidth=0, label="Goal (routing only)")
-
-    plot!(plt0, [NaN],[NaN], color=:lightsteelblue, linewidth=5, alpha=0.3, label="Hex tiles")
-    plot!(plt0, [NaN],[NaN], color=:steelblue,    linewidth=1.2, label="Heading edges")
-    plot!(plt0, [NaN],[NaN], color=:orange,       linewidth=0.9, label="goal edge")
-
-    set_hex_world_limits!(plt0, graph)
-
-    savefig(plt0, "fig0_graph.png")
-    println("Fig 0 saved  ($(length(drawn)) edges, $(graph.n) nodes)")
-end
-
-# ==========================================================================
 # Figure 1 - discrete graph solution
 # ==========================================================================
 let
     plt1 = make_base_plot(landmarks, graph)
     if !isempty(paths)
+        println("Figure path-role mapping: supports = paths[1:$(max(length(paths)-1,0))], primary = paths[$(length(paths))]")
         # Plot waypoints and paths
         for (vi, path) in enumerate(paths)
             if !isempty(path)
                 px_  = [graph.landmarks[j].x for j in path]
                 py_  = [graph.landmarks[j].y for j in path]
-                clr  = vi==length(paths) ? :blue : get(agent_colors, vi, :gray)
-                lbl  = vi==length(paths) ? "Primary" : "Support $vi"
+                is_primary = (vi == length(paths))
+                clr  = is_primary ? :blue : get(agent_colors, vi, :gray)
+                lbl  = is_primary ? "Primary (path[$vi])" : "Support $vi (path[$vi])"
                 if vi != length(paths)
                     py_ = py_ .+ (SUPPORT_PLOT_OFFSET_M * vi)
                     lbl *= " (offset)"
                 end
                 # Vary linestyle by support agent index: dash, dashdot, etc.
-                ls   = vi==length(paths) ? :solid : (vi == 1 ? :dash : (vi == 2 ? :dashdot : :dot))
+                ls   = is_primary ? :solid : (vi == 1 ? :dash : (vi == 2 ? :dashdot : :dot))
+                lw   = is_primary ? 2.4 : 1.3
                 plot!(plt1, px_, py_, label=lbl, color=clr,
-                      linewidth=vi==length(paths) ? 2.0 : 1.2,
+                      linewidth=lw,
                       linestyle=ls)
                 scatter!(plt1, px_, py_, label=false, color=clr, markersize=3, markerstrokewidth=0)
             end
@@ -3761,34 +2109,6 @@ let
     end
     xlabel!(plt1,"x (m)"); ylabel!(plt1,"y (m)")
     savefig(plt1,"fig1_joint_discrete_astar.png"); println("Fig 1 saved.")
-end
-
-# ==========================================================================
-# Figure 2 - agent visibility view (always generated)
-# ==========================================================================
-let
-    plt2v = make_base_plot(landmarks, graph)
-    if !isempty(paths)
-        for (vi, path) in enumerate(paths)
-            isempty(path) && continue
-            px_ = [graph.landmarks[j].x for j in path]
-            py_ = [graph.landmarks[j].y for j in path]
-            clr = vi==length(paths) ? :blue : get(agent_colors, vi, :gray)
-            lbl = vi==length(paths) ? "Primary" : "Support $vi"
-            if vi != length(paths)
-                py_ = py_ .+ (SUPPORT_PLOT_OFFSET_M * vi)
-                lbl *= " (offset)"
-            end
-            ls = vi==length(paths) ? :solid : (vi == 1 ? :dash : (vi == 2 ? :dashdot : :dot))
-            plot!(plt2v, px_, py_, label=lbl, color=clr, linewidth=2.0, linestyle=ls)
-            scatter!(plt2v, px_, py_, label=false, color=clr, markersize=4, markerstrokewidth=0)
-        end
-        title!(plt2v, "Fig 2: Agents")
-    else
-        title!(plt2v, "Fig 2: No feasible path")
-    end
-    xlabel!(plt2v, "x (m)"); ylabel!(plt2v, "y (m)")
-    savefig(plt2v, "fig2_agent_visibility.png"); println("Fig 2 saved.")
 end
 
 # ==========================================================================
@@ -3952,7 +2272,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         # Feasibility: uncertainty <= threshold AND max_curvature <= MAX_CURVATURE
         # (straight paths with infinite turn radius are valid; Inf curvature at stationary points is fixed by smoothing)
         init_curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in init_curvs)
-        init_feasible = init_unc <= UNC_RADIUS_THRESHOLD && init_curvature_ok
+        init_feasible = unc_within_threshold(init_unc) && init_curvature_ok
         
         if !init_feasible
             println("  [Smoothing] Initial point is infeasible; smoothing into feasible region...")
@@ -3963,7 +2283,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                 
                 # Penalties for constraint violations
                 unc_penalty = 0.0
-                if unc > UNC_RADIUS_THRESHOLD
+                if unc_exceeds_threshold(unc)
                     unc_penalty = 1e3 * (unc - UNC_RADIUS_THRESHOLD)^2
                 end
                 
@@ -4034,7 +2354,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                 
                 # Check feasibility (ignore Inf curvatures from stationary points)
                 slen, sunc, swpts, _, scurvs, smax_curv, _ = eval_continuous(smooth_flat)
-                sfeas = sunc <= UNC_RADIUS_THRESHOLD && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in scurvs)
+                sfeas = unc_within_threshold(sunc) && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in scurvs)
                 
                 if mod(smooth_iter, 50) == 0
                     smin_turn = isempty(smax_curv) || maximum(smax_curv) < 1e-12 ? Inf : 1.0 / maximum(smax_curv)
@@ -4071,6 +2391,9 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         opt_unc_log = Float64[init_unc]
         init_support_lens = [bspline_path_length(init_wpts[a]) for a in 1:(num_agents - 1)]
         opt_support_len_logs = [Float64[init_support_lens[a]] for a in 1:(num_agents - 1)]
+        # Support agent uncertainties at goal during optimization
+        init_support_uncs = [unc_radius(init_covs[a][end]) for a in 1:(num_agents - 1)]
+        opt_support_unc_logs = [Float64[init_support_uncs[a]] for a in 1:(num_agents - 1)]
 
         local best_flat = copy(flat)
         local best_len = init_len
@@ -4152,13 +2475,14 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                 flat .= trial
 
                 len2, unc2, wpts2, covs2, curv2, max_curv2, _ = eval_continuous(flat)
-                feasible = unc2 <= UNC_RADIUS_THRESHOLD && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in curv2)
+                feasible = unc_within_threshold(unc2) && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in curv2)
 
                 push!(opt_iter_log, total_iter)
                 push!(opt_len_log, len2)
                 push!(opt_unc_log, unc2)
                 for a in 1:(num_agents - 1)
                     push!(opt_support_len_logs[a], bspline_path_length(wpts2[a]))
+                    push!(opt_support_unc_logs[a], unc_radius(covs2[a][end]))
                 end
 
                 if mod(total_iter, 20) == 0
@@ -4193,14 +2517,31 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         # Evaluate best solution: prefer best feasible iterate if one exists.
         selected_flat = isnothing(best_feasible_flat) ? best_flat : best_feasible_flat
         opt_len, opt_unc, opt_wpts, opt_covs, opt_curvs, opt_max_curv, opt_ctrls = eval_continuous(selected_flat)
+        opt_support_lens = [bspline_path_length(opt_wpts[a]) for a in 1:(num_agents - 1)]
+        opt_support_uncs = [unc_radius(opt_covs[a][end]) for a in 1:(num_agents - 1)]
+
+        # Append the selected solution as a final log sample so convergence traces
+        # end at the actual accepted output (not necessarily the last optimizer iterate).
+        selected_iter = isempty(opt_iter_log) ? 0 : (opt_iter_log[end] + 1)
+        push!(opt_iter_log, selected_iter)
+        push!(opt_len_log, opt_len)
+        push!(opt_unc_log, opt_unc)
+        for a in 1:(num_agents - 1)
+            push!(opt_support_len_logs[a], opt_support_lens[a])
+            push!(opt_support_unc_logs[a], opt_support_uncs[a])
+        end
+
         opt_max_curv_peak = isempty(opt_max_curv) ? 0.0 : maximum(opt_max_curv)
         opt_turn_r = opt_max_curv_peak < 1e-12 ? Inf : 1.0 / opt_max_curv_peak
         curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in opt_curvs)
         turn_txt = isfinite(opt_turn_r) ? round(opt_turn_r, digits=3) : Inf
         println("  Final: prim_len=$(round(opt_len, digits=3)), unc=$(round(opt_unc, digits=4)), " *
             "min_turn_radius=$(turn_txt), threshold=$(UNC_RADIUS_THRESHOLD)")
+        for a in 1:(num_agents - 1)
+            println("         support $a: len=$(round(opt_support_lens[a], digits=3)), unc=$(round(opt_support_uncs[a], digits=4))")
+        end
         
-        if opt_unc <= UNC_RADIUS_THRESHOLD && curvature_ok
+        if unc_within_threshold(opt_unc) && curvature_ok
             println("  ✓ Optimization successful — uncertainty constraint met")
             
             # Figure 2: optimized continuous paths
@@ -4211,7 +2552,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                 ys = [w[2] for w in wpts]
                 is_prim = is_primary_mask[ai]
                 clr = is_prim ? :blue : get(agent_colors, ai, :gray)
-                lbl = is_prim ? "Primary" : "Support $ai"
+                lbl = is_prim ? "Primary (path[$ai])" : "Support $ai (path[$ai])"
                 if !is_prim
                     ys = ys .+ (SUPPORT_PLOT_OFFSET_M * ai)
                     lbl *= " (offset)"
@@ -4234,32 +2575,73 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                                           nstd=2, color=:blue, alpha=0.10)
             end
             
-            title!(plt2,"Fig 3: Continuous [len=$(round(opt_len,digits=2)), unc=$(round(opt_unc,digits=3))]")
+            title!(plt2,"Fig 2: Continuous [len=$(round(opt_len,digits=2)), unc=$(round(opt_unc,digits=3))]")
             xlabel!(plt2,"x (m)"); ylabel!(plt2,"y (m)")
-            savefig(plt2,"fig3_continuous_opt.png"); println("Fig 3 saved.")
+            savefig(plt2,"fig2_continuous_opt.png"); println("Fig 2 saved.")
             
-            # Figure 3: convergence plot
-            plt3 = plot(opt_iter_log, opt_len_log,
-                       label="Path length", color=:blue, linewidth=2,
-                       xlabel="Iteration", ylabel="Path length",
-                       title="Fig 4: Length vs Iter",
-                       legend=:topright)
-                 for a in 1:(num_agents - 1)
-                  support_clr = get(agent_colors, a, :gray)
-                  plot!(plt3, opt_iter_log, opt_support_len_logs[a],
+            # Figure 3: convergence plots (length and uncertainty)
+            # Left subplot: path length convergence
+            plt3a = plot(opt_iter_log, opt_len_log,
+                        label="Primary length", color=:blue, linewidth=2,
+                        xlabel="Iteration", ylabel="Path length (m)",
+                        legend=:topright)
+            for a in 1:(num_agents - 1)
+                support_clr = get(agent_colors, a, :gray)
+                plot!(plt3a, opt_iter_log, opt_support_len_logs[a],
                      label="Support $a length", color=support_clr, linewidth=1.5, linestyle=:dash)
-                 end
-            hline!(plt3, [init_len], label="Initial ($(round(init_len,digits=2)))",
-                   color=:gray, linestyle=:dash, linewidth=1.2)
-            hline!(plt3, [opt_len], label="Final ($(round(opt_len,digits=2)))",
-                   color=:red, linestyle=:dot, linewidth=1.2)
-            savefig(plt3,"fig4_convergence.png"); println("Fig 4 saved.")
+                  hline!(plt3a, [opt_support_lens[a]], label="Support $a final ($(round(opt_support_lens[a],digits=2)))",
+                      color=support_clr, linestyle=:dot, linewidth=1.0, alpha=0.45)
+            end
+            hline!(plt3a, [init_len], label="Init ($(round(init_len,digits=2)))",
+                   color=:gray, linestyle=:dash, linewidth=1.0, alpha=0.5)
+            hline!(plt3a, [opt_len], label="Final ($(round(opt_len,digits=2)))",
+                   color=:red, linestyle=:dot, linewidth=1.0, alpha=0.5)
+            
+            # Right subplot: uncertainty convergence
+            plt3b = plot(opt_iter_log, opt_unc_log,
+                        label="Primary unc", color=:blue, linewidth=2,
+                        xlabel="Iteration", ylabel="Uncertainty (m)",
+                        legend=:topright)
+            for a in 1:(num_agents - 1)
+                support_clr = get(agent_colors, a, :gray)
+                plot!(plt3b, opt_iter_log, opt_support_unc_logs[a],
+                     label="Support $a unc", color=support_clr, linewidth=1.5, linestyle=:dash)
+                hline!(plt3b, [opt_support_uncs[a]], label="Support $a final ($(round(opt_support_uncs[a],digits=4)))",
+                       color=support_clr, linestyle=:dot, linewidth=1.0, alpha=0.45)
+            end
+            hline!(plt3b, [init_unc], label="Init ($(round(init_unc,digits=4)))",
+                   color=:gray, linestyle=:dash, linewidth=1.0, alpha=0.5)
+            hline!(plt3b, [opt_unc], label="Final ($(round(opt_unc,digits=4)))",
+                   color=:red, linestyle=:dot, linewidth=1.0, alpha=0.5)
+            hline!(plt3b, [UNC_RADIUS_THRESHOLD], label="Threshold",
+                   color=:green, linestyle=:solid, linewidth=1.0, alpha=0.3)
+            
+            plt3 = plot(plt3a, plt3b, layout=(1,2), size=(1400, 400),
+                       plot_title="Fig 3: Continuous Optimization Convergence")
+            savefig(plt3,"fig3_convergence.png"); println("Fig 3 saved.")
         else
-            # Fallback: if discrete was feasible but continuous failed, accept discrete solution
-            discrete_feasible = init_unc <= UNC_RADIUS_THRESHOLD
-            if discrete_feasible
+            # Fallback: if continuous optimization is infeasible, optionally continue
+            # relaxed-threshold A* instead of stopping at this seed.
+            discrete_feasible_relaxed = unc_within_threshold(init_unc, disc_unc_threshold)
+            if CONTINUE_ASTAR_ON_INFEASIBLE && PIPELINE_MODE == :discrete_then_continuous
+                println("  ⚠ Continuous optimization infeasible; continuing A* under relaxed threshold for an alternate seed...")
+                next_support_paths, next_primary_path, next_primary_dist = run_discrete_seed_search(disc_unc_threshold)
+                if !isempty(next_primary_path)
+                    support_paths = next_support_paths
+                    primary_path = next_primary_path
+                    primary_dist = next_primary_dist
+                    paths = vcat(support_paths, [primary_path])
+                    final_global_cov, dists = evaluate_full_paths(paths, graph, landmarks, NUM_AGENTS)
+                    uncs = [unc_radius(final_global_cov[a]) for a in 1:NUM_AGENTS]
+                    println("  ✓ Alternate relaxed-feasible discrete seed found; using continued A* output (goal_unc=$(round(uncs[end],digits=4))).")
+                elseif discrete_feasible_relaxed
+                    println("  ⚠ No alternate relaxed seed found; keeping current relaxed-feasible seed: unc=$(round(init_unc,digits=4)) ≤ $(round(disc_unc_threshold,digits=4))")
+                else
+                    println("  ✗ No alternate relaxed seed found, and current seed is infeasible under relaxed threshold.")
+                end
+            elseif discrete_feasible_relaxed
                 println("  ⚠ Continuous optimization failed turn-radius constraint, but discrete solution is feasible")
-                println("  → Accepting discrete solution: unc=$(round(init_unc,digits=4)) ≤ $(UNC_RADIUS_THRESHOLD)")
+                println("  → Accepting discrete solution under relaxed threshold: unc=$(round(init_unc,digits=4)) ≤ $(round(disc_unc_threshold,digits=4))")
             else
                 println("  ✗ Optimization did not meet feasibility constraints (unc=$(round(opt_unc,digits=4)), Rmin=$(turn_txt))")
             end
