@@ -2117,12 +2117,14 @@ end
 # Optimize waypoint positions (x, y) in continuous space to minimize primary
 # path length while maintaining uncertainty constraint.
 #
-# Free variables: (x, y) coordinates of all intermediate waypoints across all
-# agents. Start and goal positions are fixed.
+# Free variables: (x, y) coordinates of all primary intermediate waypoints and
+# all support waypoints after their starts. Primary start/goal are fixed;
+# support starts are fixed.
 #
 # Objective  : minimize primary agent's total path length (Euclidean distances)
-# Constraint : joint unc_radius(Σ_goal) ≤ UNC_RADIUS_THRESHOLD
-#              enforced by gradient projection after each step
+# Constraint : joint unc_radius(Σ_goal) ≤ UNC_RADIUS_THRESHOLD,
+#              support length ≤ primary length,
+#              and curvature bounds
 
 const CONT_OPT_ITERS  = 1000        # Adam iteration budget (safety limit)
 const CONT_OPT_LR     = 5e-1       # Adam learning rate for waypoint positions
@@ -2168,36 +2170,55 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         end
     end
     
-    # Count free variables: all intermediate waypoints (keep start/goal fixed)
+    # Count free variables:
+    # - Primary: keep start+goal fixed; optimize intermediate points.
+    # - Support: keep start fixed; optimize all subsequent points, including endpoint.
     num_agents = length(paths)
     free_counts = Int[]
     for ai in 1:num_agents
         n_wpts = length(all_agent_wpts[ai])
-        if n_wpts <= 2
-            push!(free_counts, 0)  # Start and goal only, no free points
+        if ai == num_agents
+            if n_wpts <= 2
+                push!(free_counts, 0)
+            else
+                push!(free_counts, (n_wpts - 2) * 2)
+            end
         else
-            push!(free_counts, (n_wpts - 2) * 2)  # (n_wpts - 2) intermediate points × 2 coordinates
+            if n_wpts <= 1
+                push!(free_counts, 0)
+            else
+                push!(free_counts, (n_wpts - 1) * 2)
+            end
         end
     end
     total_free_cont = sum(free_counts)
     
     if total_free_cont > 0
-        # Function to pack waypoints into flat vector (start/goal fixed, intermediate free)
+        # Pack waypoints into a flat vector of free decision variables.
         function pack_waypoints(wpts_list::Vector{Vector{Tuple{Float64,Float64}}})
             flat = Float64[]
             for ai in 1:num_agents
                 wpts = wpts_list[ai]
-                if length(wpts) > 2
-                    for i in 2:length(wpts)-1  # intermediate waypoints only
-                        push!(flat, wpts[i][1])  # x
-                        push!(flat, wpts[i][2])  # y
+                if ai == num_agents
+                    if length(wpts) > 2
+                        for i in 2:length(wpts)-1
+                            push!(flat, wpts[i][1])
+                            push!(flat, wpts[i][2])
+                        end
+                    end
+                else
+                    if length(wpts) > 1
+                        for i in 2:length(wpts)
+                            push!(flat, wpts[i][1])
+                            push!(flat, wpts[i][2])
+                        end
                     end
                 end
             end
             return flat
         end
         
-        # Function to unpack flat vector back to waypoints
+        # Unpack flat vector back to waypoints.
         function unpack_waypoints(flat::Vector{Float64})
             wpts_list = Vector{Vector{Tuple{Float64,Float64}}}(undef, num_agents)
             idx = 1
@@ -2206,24 +2227,48 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                 n_wpts = length(orig_wpts)
                 wpts = Vector{Tuple{Float64,Float64}}(undef, n_wpts)
                 
-                # Keep start point fixed
+                # Keep start fixed for all agents.
                 wpts[1] = orig_wpts[1]
-                
-                # Unpack intermediate waypoints
-                if n_wpts > 2
-                    for i in 2:n_wpts-1
-                        x = flat[idx]
-                        y = flat[idx+1]
-                        wpts[i] = (x, y)
-                        idx += 2
+
+                if ai == num_agents
+                    # Primary: optimize intermediate points only; keep endpoint fixed.
+                    if n_wpts > 2
+                        for i in 2:n_wpts-1
+                            x = flat[idx]
+                            y = flat[idx+1]
+                            wpts[i] = (x, y)
+                            idx += 2
+                        end
+                    end
+                    if n_wpts >= 2
+                        wpts[n_wpts] = orig_wpts[n_wpts]
+                    end
+                else
+                    # Support: optimize every waypoint after start, including endpoint.
+                    if n_wpts > 1
+                        for i in 2:n_wpts
+                            x = flat[idx]
+                            y = flat[idx+1]
+                            wpts[i] = (x, y)
+                            idx += 2
+                        end
                     end
                 end
-                
-                # Keep goal point fixed
-                wpts[n_wpts] = orig_wpts[n_wpts]
+
                 wpts_list[ai] = wpts
             end
             return wpts_list
+        end
+
+        @inline function support_length_violation(primary_len::Float64, support_lens::Vector{Float64})
+            v = 0.0
+            for sl in support_lens
+                slack = primary_len - sl
+                if slack < -UNC_FEAS_TOL
+                    v += (-slack)^2
+                end
+            end
+            return v
         end
         
         # Objective helper: evaluate spline-sampled paths, uncertainty, and curvature.
@@ -2240,27 +2285,31 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
 
             if any(pt -> !isfinite(pt[1]) || !isfinite(pt[2]), Iterators.flatten(sampled_paths))
                 empty_covs = [Matrix{Float64}[] for _ in 1:num_agents]
-                return Inf, Inf, sampled_paths, empty_covs, curvatures, max_curvatures, ctrl_list
+                support_lens = fill(Inf, max(0, num_agents - 1))
+                return Inf, Inf, sampled_paths, empty_covs, curvatures, max_curvatures, ctrl_list, support_lens
             end
 
             unc_eval_paths = CONT_UNC_USE_WAYPOINTS ? ctrl_list : sampled_paths
             covs_all, _ = evaluate_joint_discrete(unc_eval_paths, landmarks, num_agents)
             if isempty(covs_all) || isempty(covs_all[end]) || any(!isfinite, covs_all[end][end])
-                return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list
+                support_lens = fill(Inf, max(0, num_agents - 1))
+                return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
             end
 
             goal_unc = unc_radius(covs_all[end][end])
             if !isfinite(goal_unc)
-                return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list
+                support_lens = fill(Inf, max(0, num_agents - 1))
+                return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
             end
             prim_len = bspline_path_length(sampled_paths[end])
+            support_lens = [bspline_path_length(sampled_paths[a]) for a in 1:(num_agents - 1)]
 
-            return prim_len, goal_unc, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list
+            return prim_len, goal_unc, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
         end
         
         # Initialize
         flat = pack_waypoints(all_agent_wpts)
-        init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls = eval_continuous(flat)
+        init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls, init_support_lens = eval_continuous(flat)
         
         init_max_curv_peak = isempty(init_max_curv) ? 0.0 : maximum(init_max_curv)
         init_min_turn = init_max_curv_peak > 1e-12 ? 1.0 / init_max_curv_peak : Inf
@@ -2272,14 +2321,15 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         # Feasibility: uncertainty <= threshold AND max_curvature <= MAX_CURVATURE
         # (straight paths with infinite turn radius are valid; Inf curvature at stationary points is fixed by smoothing)
         init_curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in init_curvs)
-        init_feasible = unc_within_threshold(init_unc) && init_curvature_ok
+        init_support_len_ok = all(sl <= init_len + UNC_FEAS_TOL for sl in init_support_lens)
+        init_feasible = unc_within_threshold(init_unc) && init_curvature_ok && init_support_len_ok
         
         if !init_feasible
             println("  [Smoothing] Initial point is infeasible; smoothing into feasible region...")
             
             # Simple quadratic penalty (not barrier) to push into feasibility
             function smoothing_objective(f::Vector{Float64})
-                plen, unc, _, _, curvatures, max_curvs, _ = eval_continuous(f)
+                plen, unc, _, _, curvatures, max_curvs, _, support_lens = eval_continuous(f)
                 
                 # Penalties for constraint violations
                 unc_penalty = 0.0
@@ -2295,9 +2345,10 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                         end
                     end
                 end
+                support_len_penalty = 1e3 * support_length_violation(plen, support_lens)
                 
                 # Slight path-length penalty to avoid bloating
-                return plen + unc_penalty + curv_penalty
+                return plen + unc_penalty + curv_penalty + support_len_penalty
             end
             
             smooth_adam_m = zeros(total_free_cont)
@@ -2353,8 +2404,11 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                 smooth_flat .= trial
                 
                 # Check feasibility (ignore Inf curvatures from stationary points)
-                slen, sunc, swpts, _, scurvs, smax_curv, _ = eval_continuous(smooth_flat)
-                sfeas = unc_within_threshold(sunc) && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in scurvs)
+                slen, sunc, swpts, _, scurvs, smax_curv, _, ssupport_lens = eval_continuous(smooth_flat)
+                support_len_ok = all(sl <= slen + UNC_FEAS_TOL for sl in ssupport_lens)
+                sfeas = unc_within_threshold(sunc) &&
+                    all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in scurvs) &&
+                    support_len_ok
                 
                 if mod(smooth_iter, 50) == 0
                     smin_turn = isempty(smax_curv) || maximum(smax_curv) < 1e-12 ? Inf : 1.0 / maximum(smax_curv)
@@ -2373,7 +2427,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
             end
             
             flat = smooth_flat
-            init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls = eval_continuous(flat)
+            init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls, init_support_lens = eval_continuous(flat)
             init_max_curv_peak = isempty(init_max_curv) ? 0.0 : maximum(init_max_curv)
             init_min_turn = init_max_curv_peak > 1e-12 ? 1.0 / init_max_curv_peak : Inf
             println("  After smoothing: prim_len=$(round(init_len, digits=3)), unc=$(round(init_unc, digits=4)), " *
@@ -2389,7 +2443,6 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         opt_iter_log = Int[0]
         opt_len_log = Float64[init_len]
         opt_unc_log = Float64[init_unc]
-        init_support_lens = [bspline_path_length(init_wpts[a]) for a in 1:(num_agents - 1)]
         opt_support_len_logs = [Float64[init_support_lens[a]] for a in 1:(num_agents - 1)]
         # Support agent uncertainties at goal during optimization
         init_support_uncs = [unc_radius(init_covs[a][end]) for a in 1:(num_agents - 1)]
@@ -2404,7 +2457,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         local prev_len = init_len
 
         function spline_barrier_objective(flat::Vector{Float64}, barrier_mu::Float64)
-            prim_len, goal_unc, _, _, curvatures, _, _ = eval_continuous(flat)
+            prim_len, goal_unc, _, _, curvatures, _, _, support_lens = eval_continuous(flat)
             unc_slack = UNC_RADIUS_THRESHOLD - goal_unc
             penalty = 0.0
             if unc_slack <= 1e-9
@@ -2420,6 +2473,14 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
                     else
                         penalty -= barrier_mu * log(slack)
                     end
+                end
+            end
+            for sl in support_lens
+                slack = prim_len - sl
+                if slack <= 1e-9
+                    penalty += 1e4 * (1e-9 - slack)^2
+                else
+                    penalty -= barrier_mu * log(slack)
                 end
             end
             return prim_len + penalty
@@ -2474,14 +2535,17 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
 
                 flat .= trial
 
-                len2, unc2, wpts2, covs2, curv2, max_curv2, _ = eval_continuous(flat)
-                feasible = unc_within_threshold(unc2) && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in curv2)
+                len2, unc2, wpts2, covs2, curv2, max_curv2, _, support_lens2 = eval_continuous(flat)
+                support_len_ok = all(sl <= len2 + UNC_FEAS_TOL for sl in support_lens2)
+                feasible = unc_within_threshold(unc2) &&
+                           all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in curv2) &&
+                           support_len_ok
 
                 push!(opt_iter_log, total_iter)
                 push!(opt_len_log, len2)
                 push!(opt_unc_log, unc2)
                 for a in 1:(num_agents - 1)
-                    push!(opt_support_len_logs[a], bspline_path_length(wpts2[a]))
+                    push!(opt_support_len_logs[a], support_lens2[a])
                     push!(opt_support_unc_logs[a], unc_radius(covs2[a][end]))
                 end
 
@@ -2516,8 +2580,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         
         # Evaluate best solution: prefer best feasible iterate if one exists.
         selected_flat = isnothing(best_feasible_flat) ? best_flat : best_feasible_flat
-        opt_len, opt_unc, opt_wpts, opt_covs, opt_curvs, opt_max_curv, opt_ctrls = eval_continuous(selected_flat)
-        opt_support_lens = [bspline_path_length(opt_wpts[a]) for a in 1:(num_agents - 1)]
+        opt_len, opt_unc, opt_wpts, opt_covs, opt_curvs, opt_max_curv, opt_ctrls, opt_support_lens = eval_continuous(selected_flat)
         opt_support_uncs = [unc_radius(opt_covs[a][end]) for a in 1:(num_agents - 1)]
 
         # Append the selected solution as a final log sample so convergence traces
@@ -2534,6 +2597,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         opt_max_curv_peak = isempty(opt_max_curv) ? 0.0 : maximum(opt_max_curv)
         opt_turn_r = opt_max_curv_peak < 1e-12 ? Inf : 1.0 / opt_max_curv_peak
         curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in opt_curvs)
+        support_len_ok_final = all(sl <= opt_len + UNC_FEAS_TOL for sl in opt_support_lens)
         turn_txt = isfinite(opt_turn_r) ? round(opt_turn_r, digits=3) : Inf
         println("  Final: prim_len=$(round(opt_len, digits=3)), unc=$(round(opt_unc, digits=4)), " *
             "min_turn_radius=$(turn_txt), threshold=$(UNC_RADIUS_THRESHOLD)")
@@ -2541,7 +2605,7 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
             println("         support $a: len=$(round(opt_support_lens[a], digits=3)), unc=$(round(opt_support_uncs[a], digits=4))")
         end
         
-        if unc_within_threshold(opt_unc) && curvature_ok
+        if unc_within_threshold(opt_unc) && curvature_ok && support_len_ok_final
             println("  ✓ Optimization successful — uncertainty constraint met")
             
             # Figure 2: optimized continuous paths
