@@ -36,7 +36,7 @@ const STRAIGHT_CONT_PRIMARY_WPTS = 11
 # MAJ_MIN_UNC_RATIO         : along-track drift ~3x cross-track (DVL characteristic)
 # SENSOR_NOISE              : USBL/LBL fix accuracy on the order of 10m (0.1 units)
 # COMM_RADIUS               : acoustic modem range on the order of a few hundred meters
-# UNC_RADIUS_THRESHOLD      : max acceptable sqrt(λ_max(Σ_goal)) at goal (~50m = 0.5 units)
+# UNC_RADIUS_THRESHOLD      : max acceptable determinant-based uncertainty at goal (~50m = 0.5 units)
 
 const DIR_UNCERTAINTY_PER_METER  = 0.05    # LOWERED from 0.30 to make path length more impactful on final uncertainty
 const MAJ_MIN_UNC_RATIO          = 3
@@ -100,7 +100,7 @@ const SUPPORT_IDLE_PENALTY  = 30.0
 # ========================================================================================
 
 # Primary agent state: (node, cumulative distance, covariance at node).
-# Dominance is over (dist, max_eigenvalue(cov)) — no risk field.
+# Dominance is over (dist, determinant-based uncertainty).
 # `visited` is a BitVector per state for cycle detection (supports arbitrary graph sizes).
 struct State
     node::Int
@@ -167,15 +167,6 @@ function generate_graph(landmarks::Vector{Landmark}; neighbors::Vector{Vector{In
     sp = floyd_warshall(dist, adj)
     return LandmarkGraph(n, landmarks, dist, orient, adj, sp)
 end
-
-# Closed-form max eigenvalue for 2×2 symmetric matrix — avoids eigvals overhead
-@inline function max_eigenvalue(M::Matrix{Float64})
-    a = M[1,1]; d = M[2,2]; b = M[1,2]
-    half_tr = (a + d) * 0.5
-    return half_tr + sqrt(max(0.0, (a - d)^2 * 0.25 + b * b))
-end
-
-unc_radius(cov::Matrix{Float64}) = sqrt(max_eigenvalue(cov))
 
 # Determinant-based scalar uncertainty metric.
 # For isotropic Σ = σ²I, this returns σ (same units as position),
@@ -567,7 +558,7 @@ function propagate_cov_discrete(positions::Vector{Tuple{Float64,Float64}},
         # 2. Landmark fusion at current position (Kalman update via information filter)
         I11 = 0.0; I12 = 0.0; I22 = 0.0
         for lm in lms
-            max_eigenvalue(lm.cov) < 1e-8 && continue
+            unc_radius(lm.cov) < 1e-8 && continue
             info = landmark_info(x_curr, y_curr, lm)
             info === nothing && continue
             I11 += info[1]; I12 += info[2]; I22 += info[3]
@@ -620,7 +611,7 @@ function propagate_cov_continuous(xs::Vector{Float64},
         # 2. Landmark fusion at current position
         I11 = 0.0; I12 = 0.0; I22 = 0.0
         for lm in lms
-            max_eigenvalue(lm.cov) < 1e-8 && continue
+            unc_radius(lm.cov) < 1e-8 && continue
             info = landmark_info(x_curr, y_curr, lm)
             info === nothing && continue
             I11 += info[1]; I12 += info[2]; I22 += info[3]
@@ -849,8 +840,8 @@ end
 # DOMINANCE / PARETO PRUNING
 # --------------------------
 # Two states at the same joint node-tuple (nodes[1..K]) are compared on:
-#   (primary_dist, max_eigenvalue(primary_cov))
-# State A dominates B iff A.g ≤ B.g AND λ_max(A.covs[end]) ≤ λ_max(B.covs[end]).
+#   (primary_dist, determinant-based uncertainty)
+# State A dominates B iff A.g ≤ B.g AND unc_radius(A.covs[end]) ≤ unc_radius(B.covs[end]).
 # Dominated states are discarded.  This is sound because:
 #   (a) A's remaining primary cost cannot exceed B's (same heuristic from same node)
 #   (b) A's primary uncertainty at goal cannot exceed B's (covariance only grows)

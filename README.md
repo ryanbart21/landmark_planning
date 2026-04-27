@@ -19,7 +19,7 @@ This is the main section to tune for feasibility and runtime.
 ### Strict uncertainty limit
 
 - `UNC_RADIUS_THRESHOLD`
-  - The true feasibility bound for primary goal uncertainty.
+  - The true feasibility bound for primary goal uncertainty, measured with the determinant-based scalar uncertainty metric.
   - Lower value: harder problem, usually slower search, more failures.
   - Higher value: easier feasibility, typically faster.
 
@@ -71,7 +71,7 @@ Practical guidance:
 
 - Start/goal: `START_POS`, `GOAL_POS`
 - Landmark placement: `make_scattered_landmarks(...)`
-- Landmark uncertainty: `random_landmark_cov()`
+- Landmark uncertainty: `random_landmark_cov()` uses the same determinant-based covariance metric as the planner.
 - Grid scale: `HEX_WIDTH_M`, `HEX_RADIUS_M`
 
 ## Guarantees (concise)
