@@ -17,7 +17,7 @@ const PRIMARY_EPSILON            = 0.0
 const UNC_RADIUS_THRESHOLD       = 3.75
 const UNC_FEAS_TOL               = 1e-6
 
-const ENABLE_RELAXED_DISCRETE_FOR_CONTINUOUS = true
+const ENABLE_RELAXED_DISCRETE_FOR_CONTINUOUS = false
 const RELAXED_DISCRETE_DELTA_MODE = :relative
 const RELAXED_DISCRETE_DELTA_ABS  = 0.20
 const RELAXED_DISCRETE_DELTA_REL  = 0.2
@@ -28,7 +28,18 @@ const PRUNE_BY_PRIMARY_UNCERTAINTY = false
 const PRUNE_BY_SUPPORT_UNCERTAINTY = false
 
 const STRAIGHT_CONT_PRIMARY_WPTS = 11
+const ASTAR_ITERATION_LIMIT = 200000   # default max A* iterations for collector (Inf for unlimited)
 
+# ASTAR mode: choose how discrete A* returns results
+#  :limit     => always run the collector until `ASTAR_ITERATION_LIMIT` and return multiple paths
+#  :threshold => stop when the first feasible path under the uncertainty threshold is found (single path)
+const ASTAR_MODE = :limit
+
+# Landmark scenario toggle: :single, :dual, :clustered, :shoreline
+const LANDMARK_SCENARIO = :single
+
+# Global holder for pareto seeds collected by A* (populated by run_discrete_seed_search)
+PARETO_COLLECTED = Vector{Tuple{Vector{Vector{Int}}, Float64, Float64, Int}}()
 # Physical scale: 1 unit = 100m. Graph spans ~1600m x 1500m.
 # Platform: AUV with DVL+IMU dead reckoning, acoustic landmark fixes.
 #
@@ -1468,6 +1479,194 @@ function joint_astar(graph::LandmarkGraph,
     return [Int[] for _ in 1:na], zeros(na), Inf
 end
 
+
+# ------------------------------------------------------------------
+# Collector variant of joint A*: run up to `max_iters` expansions and
+# collect all goal states popped. Returns a vector of tuples
+# (agent_paths, primary_dist, primary_unc, iter_popped).
+# ------------------------------------------------------------------
+function joint_astar_collect(graph::LandmarkGraph,
+                             lms::Vector{Landmark},
+                             unc_threshold::Float64,
+                             num_agents::Int; max_iters::Int=ASTAR_ITERATION_LIMIT)
+    # We'll largely reuse joint_astar logic but keep the loop focused on
+    # collecting goal pops rather than returning on first feasible solution.
+    n         = graph.n
+    goal      = n
+    na        = num_agents
+    primary   = na
+
+    # Use single-agent fast path for na==1
+    if na == 1
+        # reuse single-agent search but collect all goal pops (rare)
+        w_astar = 1.0 + PRIMARY_EPSILON
+        init_visited = falses(n)
+        init_visited[1] = true
+        states_sa = State[]
+        push!(states_sa, State(1, 0.0, copy(lms[1].cov), -1, init_visited))
+        pq_sa = PriorityQueue{Int, Tuple{Float64, Float64}}()
+        h0 = graph.shortest_paths[1, goal]
+        enqueue!(pq_sa, 1, (w_astar * h0, unc_radius(states_sa[1].cov)))
+        frontier_at_node = Dict{Int, Vector{Tuple{Float64, Matrix{Float64}}}}()
+        frontier_at_node[1] = [(0.0, copy(states_sa[1].cov))]
+
+        iter_count_sa = 0
+        collected = []
+        while !isempty(pq_sa) && iter_count_sa < max_iters
+            si = dequeue!(pq_sa)
+            S = states_sa[si]
+            iter_count_sa += 1
+
+            if S.node == goal
+                path = Int[]; psi = si
+                while psi != -1
+                    pushfirst!(path, states_sa[psi].node)
+                    psi = states_sa[psi].parent
+                end
+                exact_covs, exact_dists = evaluate_full_paths([path], graph, lms, 1)
+                exact_unc = unc_radius(exact_covs[1])
+                push!(collected, ( [path], exact_dists[1], exact_unc, iter_count_sa ))
+                continue
+            end
+
+            for u in graph.neighbors[S.node]
+                S.visited[u] && continue
+                nd = S.dist + graph.distance[S.node, u]
+                ncov = edge_cov_continuous(S.node, u, graph, lms, S.cov)
+                if !haskey(frontier_at_node, u)
+                    frontier_at_node[u] = Tuple{Float64, Matrix{Float64}}[]
+                end
+                dominated = false
+                for (od, ocov) in frontier_at_node[u]
+                    if od <= nd + 1e-9 && cov_dominates(ocov, ncov)
+                        dominated = true; break
+                    end
+                end
+                dominated && continue
+                kept = Tuple{Float64, Matrix{Float64}}[]
+                for (od, ocov) in frontier_at_node[u]
+                    if nd <= od + 1e-9 && cov_dominates(ncov, ocov)
+                        continue
+                    end
+                    push!(kept, (od, ocov))
+                end
+                push!(kept, (nd, copy(ncov)))
+                frontier_at_node[u] = kept
+
+                nvis = copy(S.visited); nvis[u] = true
+                push!(states_sa, State(u, nd, ncov, si, nvis))
+                nsi = length(states_sa)
+                nh = graph.shortest_paths[u, goal]
+                enqueue!(pq_sa, nsi, (nd + w_astar * nh, unc_radius(ncov)))
+            end
+        end
+
+        return collected
+    end
+
+    # For multi-agent case use joint A* core but collect goal pops
+    init_paths   = [fill(1, 1) for _ in 1:na]
+    init_visited = [falses(n) for _ in 1:na]
+    for a in 1:na; init_visited[a][1] = true; end
+    init_covs, init_dists = evaluate_full_paths(init_paths, graph, lms, na)
+    states = JointState[]; push!(states, JointState(init_paths, init_covs, init_dists, 0.0, -1, init_visited))
+    exact_state_best = Dict{Tuple{Vararg{Tuple{Vararg{Int}}}}, Int}()
+    exact_state_best[joint_path_key(init_paths)] = 1
+    w_astar = 1.0 + PRIMARY_EPSILON
+    pq = PriorityQueue{Int, Tuple{Float64, Float64, Float64}}()
+    init_h = joint_heuristic(init_paths, goal, graph)
+    init_f = init_dists[primary] + w_astar * init_h
+    enqueue!(pq, 1, (init_f, unc_radius(init_covs[primary]), support_idle_score(init_dists)))
+
+    frontier_by_signature = Dict{Any, Vector{Tuple{Float64, Matrix{Float64}}}}()
+    init_sig = (joint_node_key(init_paths), joint_visited_key(init_visited))
+    frontier_by_signature[init_sig] = [(0.0, copy(init_covs[primary]))]
+
+    iter_count = 0
+    collected = []
+
+    while !isempty(pq) && iter_count < max_iters
+        si = dequeue!(pq); S = states[si]; iter_count += 1
+
+        if S.paths[primary][end] == goal
+            agent_paths = [copy(S.paths[a]) for a in 1:na]
+            exact_covs, exact_dists = evaluate_full_paths(agent_paths, graph, lms, na)
+            exact_unc = unc_radius(exact_covs[primary])
+            push!(collected, (agent_paths, exact_dists[primary], exact_unc, iter_count))
+            # continue searching for other goal candidates
+            continue
+        end
+
+        # Expansion (reuse expand_joint_moves closure from joint_astar)
+        candidate_nodes = Vector{Int}(undef, na)
+        move_order = Vector{Int}(undef, na)
+        move_order[1] = primary; order_pos = 2
+        for a in 1:na; a == primary && continue; move_order[order_pos] = a; order_pos += 1; end
+
+        function expand_joint_moves(agent_idx::Int, primary_dist::Float64)
+            if agent_idx > na
+                new_paths = [copy(S.paths[a]) for a in 1:na]
+                new_covs = Vector{Matrix{Float64}}(undef, na)
+                new_dists = Vector{Float64}(undef, na)
+                new_visited = [copy(S.visited[a]) for a in 1:na]
+                for a in 1:na
+                    u = candidate_nodes[a]
+                    prev_node = S.paths[a][end]
+                    push!(new_paths[a], u)
+                    new_dists[a] = S.dists[a] + graph.distance[prev_node, u]
+                    new_covs[a] = edge_cov_continuous(prev_node, u, graph, lms, S.covs[a])
+                    new_visited[a][u] = true
+                end
+                for a in 1:(primary - 1); new_dists[a] > new_dists[primary] && return; end
+                new_covs = apply_joint_step_comms(new_covs, candidate_nodes, new_dists, graph)
+                new_g = new_dists[primary]
+                sig_key = (joint_node_key(new_paths), joint_visited_key(new_visited))
+                labels = get(frontier_by_signature, sig_key, Tuple{Float64, Matrix{Float64}}[])
+                for (od, ocov) in labels
+                    if od <= new_g + 1e-9 && cov_dominates(ocov, new_covs[primary])
+                        return
+                    end
+                end
+                kept_labels = Tuple{Float64, Matrix{Float64}}[]
+                for (od, ocov) in labels
+                    if new_g <= od + 1e-9 && cov_dominates(new_covs[primary], ocov)
+                        continue
+                    end
+                    push!(kept_labels, (od, ocov))
+                end
+                push!(kept_labels, (new_g, copy(new_covs[primary])))
+                frontier_by_signature[sig_key] = kept_labels
+                new_path_key = joint_path_key(new_paths)
+                if haskey(exact_state_best, new_path_key) && exact_state_best[new_path_key] > 0
+                    return
+                end
+                push!(states, JointState(copy(new_paths), new_covs, new_dists, new_g, si, new_visited))
+                new_si = length(states)
+                exact_state_best[new_path_key] = new_si
+                enqueue!(pq, new_si, (new_g + w_astar * joint_heuristic(new_paths, goal, graph), unc_radius(new_covs[primary]), support_idle_score(new_dists)))
+                return
+            end
+            agent = move_order[agent_idx]
+            curr_node = S.paths[agent][end]
+            for u in graph.neighbors[curr_node]
+                S.visited[agent][u] && continue
+                candidate_nodes[agent] = u
+                if agent == primary
+                    primary_dist_next = S.dists[primary] + graph.distance[curr_node, u]
+                    expand_joint_moves(agent_idx + 1, primary_dist_next)
+                else
+                    support_dist_next = S.dists[agent] + graph.distance[curr_node, u]
+                    support_dist_next <= primary_dist && expand_joint_moves(agent_idx + 1, primary_dist)
+                end
+            end
+        end
+
+        expand_joint_moves(1, S.dists[primary])
+    end
+
+    return collected
+end
+
 # ==========================================================================
 # Top-level planner: Joint discrete A* -> continuous refinement
 # ==========================================================================
@@ -1809,18 +2008,55 @@ function random_landmark_cov()
     return [sx^2 cxy; cxy sy^2]
 end
 
-function make_scattered_landmarks(start_pos::Tuple{Float64,Float64},
-                                  goal_pos::Tuple{Float64,Float64};
-                                  n_scatter::Int = 8)
-    _ = start_pos
-    _ = goal_pos
-    _ = n_scatter
+# Four landmark scenario configurations
 
-    # Fixed, simplified landmark layout requested by user.
+function get_landmarks_single()
+    # Single landmark scenario: one landmark at (600, -250)
     return Landmark[
-        Landmark(800.0, 200.0, random_landmark_cov()),
-        Landmark(250.0, -200.0, random_landmark_cov())
+        Landmark(600.0, -250.0, random_landmark_cov())
     ]
+end
+
+function get_landmarks_dual()
+    # Dual landmark scenario: two landmarks at (250, 200) and (750, -250)
+    return Landmark[
+        Landmark(700.0, 200.0, random_landmark_cov()*1.1),
+        Landmark(750.0, -250.0, random_landmark_cov())
+    ]
+end
+
+function get_landmarks_clustered()
+    # Clustered scenario: 3 landmarks clustered
+    return Landmark[
+        Landmark(680.0, -200.0, random_landmark_cov()*3),
+        Landmark(700.0, -210.0, random_landmark_cov()*3),
+        Landmark(720.0, -190.0, random_landmark_cov()*3)
+    ]
+end
+
+function get_landmarks_shoreline()
+    # Shoreline scenario: 5 landmarks along shoreline
+    return Landmark[
+        Landmark(100.0, -300.0, random_landmark_cov()*5),
+        Landmark(300.0, -270.0, random_landmark_cov()*5),
+        Landmark(500.0, -240.0, random_landmark_cov()*5),
+        Landmark(700.0, -220.0, random_landmark_cov()*5),
+        Landmark(900.0, -200.0, random_landmark_cov()*5)
+    ]
+end
+
+function make_scattered_landmarks(scenario::Symbol=LANDMARK_SCENARIO)
+    if scenario == :clustered
+        return get_landmarks_clustered()
+    elseif scenario == :single
+        return get_landmarks_single()
+    elseif scenario == :dual
+        return get_landmarks_dual()
+    elseif scenario == :shoreline
+        return get_landmarks_shoreline()
+    else
+        error("Unknown landmark scenario: $scenario. Use :single, :dual, :clustered, :shoreline, or :random")
+    end
 end
 
 # Start and goal are plain routing waypoints — not landmarks, no covariance meaning.
@@ -1828,9 +2064,9 @@ end
 const START_POS = (0.0, 0.0)
 const GOAL_POS  = (1000.0, 0.0)
 
-# Randomized (seeded) off-axis sensor placement so low-uncertainty plans deviate
-# from the geometric shortest path.
-landmarks = make_scattered_landmarks(START_POS, GOAL_POS)
+# Select landmark configuration based on scenario toggle
+landmarks = make_scattered_landmarks(LANDMARK_SCENARIO)
+println("Landmark scenario: $(LANDMARK_SCENARIO) — $(length(landmarks)) landmarks")
 
 graph = build_hex_graph(landmarks, START_POS, GOAL_POS; hex_r=HEX_RADIUS_M)
 
@@ -1879,28 +2115,76 @@ if ENABLE_RELAXED_DISCRETE_FOR_CONTINUOUS && disc_unc_threshold > UNC_RADIUS_THR
 end
 
 function run_discrete_seed_search(search_unc_threshold::Float64)
-    println("\n  Running joint discrete A* seed search (threshold=$(round(search_unc_threshold, digits=4)))...")
-    joint_paths, joint_dists, _, _, _, _, _, _ = multi_agent_usp(
-        graph, search_unc_threshold, NUM_AGENTS;
-        lms=landmarks,
-        debug_animate=true,
-        debug_animate_start_iter=10000,
-        debug_animate_iters=300000,
-        debug_animate_sample_period=10000,
-        debug_stop_after_animate=false,
-        debug_gif_path="fig_joint_astar_progress.gif"
-    )
-
-    if !isempty(joint_paths)
-        println("  ✓ Found feasible joint discrete solution")
-        support_paths = pad_support_paths_to_primary(joint_paths[1:NUM_AGENTS-1], joint_paths[NUM_AGENTS])
-        primary_path = joint_paths[NUM_AGENTS]
-        primary_dist = joint_dists[NUM_AGENTS]
-        return support_paths, primary_path, primary_dist
+    println("\n  Running joint discrete A* collector (threshold=$(round(search_unc_threshold, digits=4)))... (max_iters=$(ASTAR_ITERATION_LIMIT))")
+    # Choose collection mode: either collect until iteration limit (multiple paths)
+    # or stop on first feasible solution under the uncertainty threshold (single path).
+    if ASTAR_MODE == :limit
+        collected = joint_astar_collect(graph, landmarks, search_unc_threshold, NUM_AGENTS; max_iters=ASTAR_ITERATION_LIMIT)
+        if isempty(collected)
+            println("  ✗ No goal candidates found by A* collector")
+            return [Int[] for _ in 1:(NUM_AGENTS - 1)], Int[], Inf
+        end
+    elseif ASTAR_MODE == :threshold
+        println("  Running threshold-stop A* (stops on first feasible under threshold)...")
+        ppaths, pdists, punc = joint_astar(graph, landmarks, search_unc_threshold, NUM_AGENTS)
+        if length(ppaths) != NUM_AGENTS || any(isempty, ppaths)
+            println("  ✗ No feasible path found by threshold-stop A*")
+            return [Int[] for _ in 1:(NUM_AGENTS - 1)], Int[], Inf
+        end
+        # Wrap single result into collected-format: (paths, dist, unc, iter=0)
+        collected = [ (ppaths, pdists[NUM_AGENTS], punc, 0) ]
+    else
+        error("Unsupported ASTAR_MODE=$(ASTAR_MODE). Use :limit or :threshold")
     end
 
-    println("  ✗ No feasible joint discrete solution found")
-    return [Int[] for _ in 1:(NUM_AGENTS - 1)], Int[], Inf
+    # Each entry: (agent_paths, dist, unc, iter)
+    # Compute Pareto front (minimize dist and unc)
+    tol = 1e-9
+    pareto = Vector{Tuple{Vector{Vector{Int}}, Float64, Float64, Int}}()
+    for (paths_c, d_c, u_c, it) in collected
+        dominated = false
+        for (p_paths, p_d, p_u, _) in pareto
+            if p_d <= d_c + tol && p_u <= u_c + tol
+                dominated = true; break
+            end
+        end
+        if dominated; continue; end
+        # remove any existing pareto points dominated by this one
+        keep = Vector{Tuple{Vector{Vector{Int}}, Float64, Float64, Int}}()
+        for item in pareto
+            p_paths, p_d, p_u, p_it = item
+            if d_c <= p_d + tol && u_c <= p_u + tol
+                continue
+            end
+            push!(keep, item)
+        end
+        push!(keep, (paths_c, d_c, u_c, it))
+        pareto = keep
+    end
+
+    # Sort pareto by increasing distance
+    sort!(pareto, by = x -> x[2])
+
+    # Plot Pareto front
+    ds = [x[2] for x in pareto]
+    us = [x[3] for x in pareto]
+    pltp = plot(ds, us, seriestype=:scatter, xlabel="Primary distance", ylabel="Primary uncertainty", title="Pareto (distance vs uncertainty)", legend=false)
+    for (i, (pp, pd, pu, it)) in enumerate(pareto)
+        annotate!(pltp, pd, pu, text("$i", :black, 8))
+    end
+    savefig(pltp, "fig_pareto_discrete.png"); println("Fig Pareto (discrete) saved: $(length(pareto)) points")
+
+    # Store pareto set for later continuous refinement (optimizer defined below)
+    global PARETO_COLLECTED
+    PARETO_COLLECTED = pareto
+    println("  Pareto seeds collected: $(length(pareto)). Continuous refinement deferred until optimizer is available.")
+
+    # Return first Pareto entry as a representative seed (for compatibility)
+    first_paths, first_d, first_u, _ = pareto[1]
+    support_paths = pad_support_paths_to_primary(first_paths[1:NUM_AGENTS-1], first_paths[NUM_AGENTS])
+    primary_path = first_paths[NUM_AGENTS]
+    primary_dist = first_d
+    return support_paths, primary_path, primary_dist
 end
 
 if PIPELINE_MODE == :straight_continuous
@@ -1940,7 +2224,7 @@ else
     println("  ├─ Communication: every $(COMM_INTERVAL)m, Gaussian taper σ=$(COMM_SIGMA)m")
     println("  └─ All agents' uncertainties benefit from synchronized Kalman fusion at checkpoints")
 
-    if PIPELINE_MODE == :discrete_then_continuous && CONTINUE_ASTAR_ON_INFEASIBLE && unc_exceeds_threshold(solo_unc, disc_unc_threshold)
+    if PIPELINE_MODE == :discrete_then_continuous && CONTINUE_ASTAR_ON_INFEASIBLE && ASTAR_MODE != :limit && unc_exceeds_threshold(solo_unc, disc_unc_threshold)
         println("\n  Seed exceeded relaxed discrete threshold (goal_unc=$(round(solo_unc, digits=4)) > threshold=$(round(disc_unc_threshold, digits=4))).")
         println("  Continuing A* under relaxed threshold...")
         next_support_paths, next_primary_path, next_primary_dist = run_discrete_seed_search(disc_unc_threshold)
@@ -2038,6 +2322,19 @@ function make_base_plot(landmarks, graph)
     return p
 end
 
+# Save control points (CSV): each row = agent, ctrl_index, x, y
+function write_ctrls_csv(filename::String, ctrls::Vector{Vector{Tuple{Float64,Float64}}})
+    open(filename, "w") do io
+        println(io, "agent,ctrl_index,x,y")
+        for (ai, ctrl) in enumerate(ctrls)
+            for (ci, pt) in enumerate(ctrl)
+                println(io, "$(ai),$(ci),$(pt[1]),$(pt[2])")
+            end
+        end
+    end
+    println("  → Saved control points to $filename ($(sum(length.(ctrls))) points)")
+end
+
 # ==========================================================================
 # Figure 1 - discrete graph solution
 # ==========================================================================
@@ -2126,8 +2423,8 @@ const CONT_ADAM_EPS   = 1e-8
 const CONT_CONV_TOL   = 1e-3       # Convergence: change in length < this
 const CONT_UNC_USE_WAYPOINTS = true # keeps straight-line continuous uncertainty consistent with discrete evaluation
 
-if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only if all agents have paths
-    println("\n=== Continuous Spline Optimization ===")
+function optimize_continuous(paths::Vector{Vector{Int}}, graph::LandmarkGraph, landmarks::Vector{Landmark}, num_agents::Int; cont_threshold::Float64=UNC_RADIUS_THRESHOLD, fig_prefix::String="")
+    println("\n=== Continuous Spline Optimization (threshold=$(round(cont_threshold, digits=4))) ===")
 
     # Initialize continuous waypoints either from discrete paths or direct-line seed.
     all_agent_wpts = Vector{Vector{Tuple{Float64,Float64}}}(undef, length(paths))
@@ -2140,13 +2437,10 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
         gx = graph.landmarks[graph.n].x
         gy = graph.landmarks[graph.n].y
         n_seed = max(3, STRAIGHT_CONT_PRIMARY_WPTS)
-
-        # Supports remain anchored (two points), primary gets direct-line seed with intermediates.
         for ai in 1:(n_agents - 1)
             all_agent_wpts[ai] = [(sx, sy), (sx, sy)]
             is_primary_mask[ai] = false
         end
-
         prim_wpts = Vector{Tuple{Float64,Float64}}(undef, n_seed)
         for i in 1:n_seed
             t = (i - 1) / (n_seed - 1)
@@ -2160,548 +2454,330 @@ if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only i
             is_primary_mask[ai] = (ai == length(paths))
         end
     end
-    
-    # Count free variables:
-    # - Primary: keep start+goal fixed; optimize intermediate points.
-    # - Support: keep start fixed; optimize all subsequent points, including endpoint.
+
+    # Count free variables
     num_agents = length(paths)
     free_counts = Int[]
     for ai in 1:num_agents
         n_wpts = length(all_agent_wpts[ai])
         if ai == num_agents
-            if n_wpts <= 2
-                push!(free_counts, 0)
-            else
-                push!(free_counts, (n_wpts - 2) * 2)
-            end
+            push!(free_counts, n_wpts <= 2 ? 0 : (n_wpts - 2) * 2)
         else
-            if n_wpts <= 1
-                push!(free_counts, 0)
-            else
-                push!(free_counts, (n_wpts - 1) * 2)
-            end
+            push!(free_counts, n_wpts <= 1 ? 0 : (n_wpts - 1) * 2)
         end
     end
     total_free_cont = sum(free_counts)
-    
-    if total_free_cont > 0
-        # Pack waypoints into a flat vector of free decision variables.
-        function pack_waypoints(wpts_list::Vector{Vector{Tuple{Float64,Float64}}})
-            flat = Float64[]
-            for ai in 1:num_agents
-                wpts = wpts_list[ai]
-                if ai == num_agents
-                    if length(wpts) > 2
-                        for i in 2:length(wpts)-1
-                            push!(flat, wpts[i][1])
-                            push!(flat, wpts[i][2])
-                        end
-                    end
-                else
-                    if length(wpts) > 1
-                        for i in 2:length(wpts)
-                            push!(flat, wpts[i][1])
-                            push!(flat, wpts[i][2])
-                        end
+
+    if total_free_cont == 0
+        println("  (No intermediate waypoints to optimize)")
+        return nothing
+    end
+
+    # pack/unpack
+    function pack_waypoints(wpts_list::Vector{Vector{Tuple{Float64,Float64}}})
+        flat = Float64[]
+        for ai in 1:num_agents
+            wpts = wpts_list[ai]
+            if ai == num_agents
+                if length(wpts) > 2
+                    for i in 2:length(wpts)-1
+                        push!(flat, wpts[i][1]); push!(flat, wpts[i][2])
                     end
                 end
-            end
-            return flat
-        end
-        
-        # Unpack flat vector back to waypoints.
-        function unpack_waypoints(flat::Vector{Float64})
-            wpts_list = Vector{Vector{Tuple{Float64,Float64}}}(undef, num_agents)
-            idx = 1
-            for ai in 1:num_agents
-                orig_wpts = all_agent_wpts[ai]
-                n_wpts = length(orig_wpts)
-                wpts = Vector{Tuple{Float64,Float64}}(undef, n_wpts)
-                
-                # Keep start fixed for all agents.
-                wpts[1] = orig_wpts[1]
-
-                if ai == num_agents
-                    # Primary: optimize intermediate points only; keep endpoint fixed.
-                    if n_wpts > 2
-                        for i in 2:n_wpts-1
-                            x = flat[idx]
-                            y = flat[idx+1]
-                            wpts[i] = (x, y)
-                            idx += 2
-                        end
-                    end
-                    if n_wpts >= 2
-                        wpts[n_wpts] = orig_wpts[n_wpts]
-                    end
-                else
-                    # Support: optimize every waypoint after start, including endpoint.
-                    if n_wpts > 1
-                        for i in 2:n_wpts
-                            x = flat[idx]
-                            y = flat[idx+1]
-                            wpts[i] = (x, y)
-                            idx += 2
-                        end
-                    end
-                end
-
-                wpts_list[ai] = wpts
-            end
-            return wpts_list
-        end
-
-        @inline function support_length_violation(primary_len::Float64, support_lens::Vector{Float64})
-            v = 0.0
-            for sl in support_lens
-                slack = primary_len - sl
-                if slack < -UNC_FEAS_TOL
-                    v += (-slack)^2
-                end
-            end
-            return v
-        end
-        
-        # Objective helper: evaluate spline-sampled paths, uncertainty, and curvature.
-        function eval_continuous(flat::Vector{Float64})
-            ctrl_list = unpack_waypoints(flat)
-
-            sampled_paths = Vector{Vector{Tuple{Float64,Float64}}}(undef, num_agents)
-            curvatures = Vector{Vector{Float64}}(undef, num_agents)
-            max_curvatures = zeros(Float64, num_agents)
-            for ai in 1:num_agents
-                sampled_paths[ai], curvatures[ai] = bspline_sample_path(ctrl_list[ai])
-                max_curvatures[ai] = isempty(curvatures[ai]) ? 0.0 : maximum(curvatures[ai])
-            end
-
-            if any(pt -> !isfinite(pt[1]) || !isfinite(pt[2]), Iterators.flatten(sampled_paths))
-                empty_covs = [Matrix{Float64}[] for _ in 1:num_agents]
-                support_lens = fill(Inf, max(0, num_agents - 1))
-                return Inf, Inf, sampled_paths, empty_covs, curvatures, max_curvatures, ctrl_list, support_lens
-            end
-
-            unc_eval_paths = CONT_UNC_USE_WAYPOINTS ? ctrl_list : sampled_paths
-            covs_all, _ = evaluate_joint_discrete(unc_eval_paths, landmarks, num_agents)
-            if isempty(covs_all) || isempty(covs_all[end]) || any(!isfinite, covs_all[end][end])
-                support_lens = fill(Inf, max(0, num_agents - 1))
-                return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
-            end
-
-            goal_unc = unc_radius(covs_all[end][end])
-            if !isfinite(goal_unc)
-                support_lens = fill(Inf, max(0, num_agents - 1))
-                return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
-            end
-            prim_len = bspline_path_length(sampled_paths[end])
-            support_lens = [bspline_path_length(sampled_paths[a]) for a in 1:(num_agents - 1)]
-
-            return prim_len, goal_unc, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
-        end
-        
-        # Initialize
-        flat = pack_waypoints(all_agent_wpts)
-        init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls, init_support_lens = eval_continuous(flat)
-        
-        init_max_curv_peak = isempty(init_max_curv) ? 0.0 : maximum(init_max_curv)
-        init_min_turn = init_max_curv_peak > 1e-12 ? 1.0 / init_max_curv_peak : Inf
-        println("  Initial (discrete→spline): prim_len=$(round(init_len, digits=3)), unc=$(round(init_unc, digits=4)), " *
-            "min_turn_radius=$(isfinite(init_min_turn) ? round(init_min_turn, digits=3) : Inf)")
-        
-        # ── PHASE 0: FEASIBILITY SMOOTHING ──
-        # Check if initial point meets both constraints. If not, smooth into feasible region first.
-        # Feasibility: uncertainty <= threshold AND max_curvature <= MAX_CURVATURE
-        # (straight paths with infinite turn radius are valid; Inf curvature at stationary points is fixed by smoothing)
-        init_curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in init_curvs)
-        init_support_len_ok = all(sl <= init_len + UNC_FEAS_TOL for sl in init_support_lens)
-        init_feasible = unc_within_threshold(init_unc) && init_curvature_ok && init_support_len_ok
-        
-        if !init_feasible
-            println("  [Smoothing] Initial point is infeasible; smoothing into feasible region...")
-            
-            # Simple quadratic penalty (not barrier) to push into feasibility
-            function smoothing_objective(f::Vector{Float64})
-                plen, unc, _, _, curvatures, max_curvs, _, support_lens = eval_continuous(f)
-                
-                # Penalties for constraint violations
-                unc_penalty = 0.0
-                if unc_exceeds_threshold(unc)
-                    unc_penalty = 1e3 * (unc - UNC_RADIUS_THRESHOLD)^2
-                end
-                
-                curv_penalty = 0.0
-                for curvset in curvatures
-                    for κ in curvset
-                        if κ > MAX_CURVATURE
-                            curv_penalty += 1e3 * (κ - MAX_CURVATURE)^2
-                        end
-                    end
-                end
-                support_len_penalty = 1e3 * support_length_violation(plen, support_lens)
-                
-                # Slight path-length penalty to avoid bloating
-                return plen + unc_penalty + curv_penalty + support_len_penalty
-            end
-            
-            smooth_adam_m = zeros(total_free_cont)
-            smooth_adam_v = zeros(total_free_cont)
-            local smooth_iter = 0
-            local smooth_max_iters = 300
-            h_smooth = CONT_OPT_H
-            lr_smooth = CONT_OPT_LR * 0.5  # Slightly reduced learning rate for stability
-            
-            local smooth_flat = copy(flat)
-            while smooth_iter < smooth_max_iters
-                smooth_iter += 1
-                
-                obj0 = smoothing_objective(smooth_flat)
-                
-                # Gradient via finite differences
-                grad = zeros(total_free_cont)
-                for k in 1:total_free_cont
-                    smooth_flat[k] += h_smooth
-                    obj1 = smoothing_objective(smooth_flat)
-                    grad[k] = (obj1 - obj0) / h_smooth
-                    smooth_flat[k] -= h_smooth
-                end
-                
-                # Adam update
-                b1t = CONT_ADAM_B1^smooth_iter
-                b2t = CONT_ADAM_B2^smooth_iter
-                step = zeros(total_free_cont)
-                for k in 1:total_free_cont
-                    g = grad[k]
-                    smooth_adam_m[k] = CONT_ADAM_B1 * smooth_adam_m[k] + (1 - CONT_ADAM_B1) * g
-                    smooth_adam_v[k] = CONT_ADAM_B2 * smooth_adam_v[k] + (1 - CONT_ADAM_B2) * g^2
-                    m̂ = smooth_adam_m[k] / (1 - b1t)
-                    v̂ = smooth_adam_v[k] / (1 - b2t)
-                    step[k] = lr_smooth * m̂ / (sqrt(v̂) + CONT_ADAM_EPS)
-                end
-                
-                # Line search
-                trial = smooth_flat .- step
-                trial_obj = smoothing_objective(trial)
-                backtracks = 0
-                while (!isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT) && backtracks < 12
-                    step .*= CONT_LINESEARCH_SHRINK
-                    trial = smooth_flat .- step
-                    trial_obj = smoothing_objective(trial)
-                    backtracks += 1
-                end
-                
-                if !isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT
-                    break
-                end
-                
-                smooth_flat .= trial
-                
-                # Check feasibility (ignore Inf curvatures from stationary points)
-                slen, sunc, swpts, _, scurvs, smax_curv, _, ssupport_lens = eval_continuous(smooth_flat)
-                support_len_ok = all(sl <= slen + UNC_FEAS_TOL for sl in ssupport_lens)
-                sfeas = unc_within_threshold(sunc) &&
-                    all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in scurvs) &&
-                    support_len_ok
-                
-                if mod(smooth_iter, 50) == 0
-                    smin_turn = isempty(smax_curv) || maximum(smax_curv) < 1e-12 ? Inf : 1.0 / maximum(smax_curv)
-                    sfeas_str = sfeas ? "✓" : "✗"
-                    println("    Smooth iter $(lpad(smooth_iter, 3)): len=$(round(slen, digits=2)), unc=$(round(sunc, digits=4)), Rmin=$(round(smin_turn, digits=1)) $sfeas_str")
-                end
-                
-                if sfeas
-                    println("    → Feasible at smoothing iter $smooth_iter")
-                    break
-                end
-            end
-            
-            if smooth_iter >= smooth_max_iters
-                println("    [Smoothing] Max iterations reached; using best feasible or closest point")
-            end
-            
-            flat = smooth_flat
-            init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls, init_support_lens = eval_continuous(flat)
-            init_max_curv_peak = isempty(init_max_curv) ? 0.0 : maximum(init_max_curv)
-            init_min_turn = init_max_curv_peak > 1e-12 ? 1.0 / init_max_curv_peak : Inf
-            println("  After smoothing: prim_len=$(round(init_len, digits=3)), unc=$(round(init_unc, digits=4)), " *
-                "min_turn_radius=$(isfinite(init_min_turn) ? round(init_min_turn, digits=3) : Inf)")
-        else
-            println("  [Smoothing] Initial point is feasible; proceeding to barrier optimization")
-        end
-        
-        # Interior-point style barrier optimizer state
-        adam_m = zeros(total_free_cont)
-        adam_v = zeros(total_free_cont)
-
-        opt_iter_log = Int[0]
-        opt_len_log = Float64[init_len]
-        opt_unc_log = Float64[init_unc]
-        opt_support_len_logs = [Float64[init_support_lens[a]] for a in 1:(num_agents - 1)]
-        # Support agent uncertainties at goal during optimization
-        init_support_uncs = [unc_radius(init_covs[a][end]) for a in 1:(num_agents - 1)]
-        opt_support_unc_logs = [Float64[init_support_uncs[a]] for a in 1:(num_agents - 1)]
-
-        local best_flat = copy(flat)
-        local best_len = init_len
-        local best_unc = init_unc
-        local best_feasible_flat::Union{Nothing,Vector{Float64}} = nothing
-        local best_feasible_len = Inf
-        local best_feasible_unc = Inf
-        local prev_len = init_len
-
-        function spline_barrier_objective(flat::Vector{Float64}, barrier_mu::Float64)
-            prim_len, goal_unc, _, _, curvatures, _, _, support_lens = eval_continuous(flat)
-            unc_slack = UNC_RADIUS_THRESHOLD - goal_unc
-            penalty = 0.0
-            if unc_slack <= 1e-9
-                penalty += 1e4 * (1e-9 - unc_slack)^2
             else
-                penalty -= barrier_mu * log(unc_slack)
+                if length(wpts) > 1
+                    for i in 2:length(wpts)
+                        push!(flat, wpts[i][1]); push!(flat, wpts[i][2])
+                    end
+                end
             end
+        end
+        return flat
+    end
+
+    function unpack_waypoints(flat::Vector{Float64})
+        wpts_list = Vector{Vector{Tuple{Float64,Float64}}}(undef, num_agents)
+        idx = 1
+        for ai in 1:num_agents
+            orig_wpts = all_agent_wpts[ai]
+            n_wpts = length(orig_wpts)
+            wpts = Vector{Tuple{Float64,Float64}}(undef, n_wpts)
+            wpts[1] = orig_wpts[1]
+            if ai == num_agents
+                if n_wpts > 2
+                    for i in 2:n_wpts-1
+                        x = flat[idx]; y = flat[idx+1]; wpts[i] = (x,y); idx += 2
+                    end
+                end
+                if n_wpts >= 2; wpts[n_wpts] = orig_wpts[n_wpts]; end
+            else
+                if n_wpts > 1
+                    for i in 2:n_wpts
+                        x = flat[idx]; y = flat[idx+1]; wpts[i] = (x,y); idx += 2
+                    end
+                end
+            end
+            wpts_list[ai] = wpts
+        end
+        return wpts_list
+    end
+
+    @inline function support_length_violation(primary_len::Float64, support_lens::Vector{Float64})
+        v = 0.0
+        for sl in support_lens
+            slack = primary_len - sl
+            if slack < -UNC_FEAS_TOL
+                v += (-slack)^2
+            end
+        end
+        return v
+    end
+
+    function eval_continuous(flat::Vector{Float64})
+        ctrl_list = unpack_waypoints(flat)
+        sampled_paths = Vector{Vector{Tuple{Float64,Float64}}}(undef, num_agents)
+        curvatures = Vector{Vector{Float64}}(undef, num_agents)
+        max_curvatures = zeros(Float64, num_agents)
+        for ai in 1:num_agents
+            sampled_paths[ai], curvatures[ai] = bspline_sample_path(ctrl_list[ai])
+            max_curvatures[ai] = isempty(curvatures[ai]) ? 0.0 : maximum(curvatures[ai])
+        end
+        if any(pt -> !isfinite(pt[1]) || !isfinite(pt[2]), Iterators.flatten(sampled_paths))
+            empty_covs = [Matrix{Float64}[] for _ in 1:num_agents]
+            support_lens = fill(Inf, max(0, num_agents - 1))
+            return Inf, Inf, sampled_paths, empty_covs, curvatures, max_curvatures, ctrl_list, support_lens
+        end
+        unc_eval_paths = CONT_UNC_USE_WAYPOINTS ? ctrl_list : sampled_paths
+        covs_all, _ = evaluate_joint_discrete(unc_eval_paths, landmarks, num_agents)
+        if isempty(covs_all) || isempty(covs_all[end]) || any(!isfinite, covs_all[end][end])
+            support_lens = fill(Inf, max(0, num_agents - 1))
+            return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
+        end
+        goal_unc = unc_radius(covs_all[end][end])
+        if !isfinite(goal_unc)
+            support_lens = fill(Inf, max(0, num_agents - 1))
+            return Inf, Inf, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
+        end
+        prim_len = bspline_path_length(sampled_paths[end])
+        support_lens = [bspline_path_length(sampled_paths[a]) for a in 1:(num_agents - 1)]
+        return prim_len, goal_unc, sampled_paths, covs_all, curvatures, max_curvatures, ctrl_list, support_lens
+    end
+
+    # Initialize optimizer state
+    flat = pack_waypoints(all_agent_wpts)
+    init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls, init_support_lens = eval_continuous(flat)
+    println("  Initial (discrete→spline): prim_len=$(round(init_len,digits=3)), unc=$(round(init_unc,digits=4))")
+
+    init_curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in init_curvs)
+    init_support_len_ok = all(sl <= init_len + UNC_FEAS_TOL for sl in init_support_lens)
+    init_feasible = unc_within_threshold(init_unc, cont_threshold) && init_curvature_ok && init_support_len_ok
+
+    if !init_feasible
+        println("  [Smoothing] Initial point is infeasible; smoothing into feasible region...")
+        function smoothing_objective(f::Vector{Float64})
+            plen, unc, _, _, curvatures, max_curvs, _, support_lens = eval_continuous(f)
+            unc_penalty = 0.0
+            if unc_exceeds_threshold(unc, cont_threshold)
+                unc_penalty = 1e3 * (unc - cont_threshold)^2
+            end
+            curv_penalty = 0.0
             for curvset in curvatures
                 for κ in curvset
-                    slack = MAX_CURVATURE - κ
-                    if slack <= 1e-9
-                        penalty += 1e4 * (1e-9 - slack)^2
-                    else
-                        penalty -= barrier_mu * log(slack)
+                    if κ > MAX_CURVATURE
+                        curv_penalty += 1e3 * (κ - MAX_CURVATURE)^2
                     end
                 end
             end
-            for sl in support_lens
-                slack = prim_len - sl
+            support_len_penalty = 1e3 * support_length_violation(plen, support_lens)
+            return plen + unc_penalty + curv_penalty + support_len_penalty
+        end
+
+        smooth_adam_m = zeros(total_free_cont)
+        smooth_adam_v = zeros(total_free_cont)
+        smooth_iter = 0; smooth_max_iters = 300
+        h_smooth = CONT_OPT_H; lr_smooth = CONT_OPT_LR * 0.5
+        smooth_flat = copy(flat)
+        while smooth_iter < smooth_max_iters
+            smooth_iter += 1
+            obj0 = smoothing_objective(smooth_flat)
+            grad = zeros(total_free_cont)
+            for k in 1:total_free_cont
+                smooth_flat[k] += h_smooth; obj1 = smoothing_objective(smooth_flat); grad[k] = (obj1 - obj0) / h_smooth; smooth_flat[k] -= h_smooth
+            end
+            b1t = CONT_ADAM_B1^smooth_iter; b2t = CONT_ADAM_B2^smooth_iter
+            step = zeros(total_free_cont)
+            for k in 1:total_free_cont
+                g = grad[k]
+                smooth_adam_m[k] = CONT_ADAM_B1 * smooth_adam_m[k] + (1 - CONT_ADAM_B1) * g
+                smooth_adam_v[k] = CONT_ADAM_B2 * smooth_adam_v[k] + (1 - CONT_ADAM_B2) * g^2
+                m̂ = smooth_adam_m[k] / (1 - b1t); v̂ = smooth_adam_v[k] / (1 - b2t)
+                step[k] = lr_smooth * m̂ / (sqrt(v̂) + CONT_ADAM_EPS)
+            end
+            trial = smooth_flat .- step; trial_obj = smoothing_objective(trial); backtracks = 0
+            while (!isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT) && backtracks < 12
+                step .*= CONT_LINESEARCH_SHRINK; trial = smooth_flat .- step; trial_obj = smoothing_objective(trial); backtracks += 1
+            end
+            if !isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT; break; end
+            smooth_flat .= trial
+            slen, sunc, swpts, _, scurvs, smax_curv, _, ssupport_lens = eval_continuous(smooth_flat)
+            support_len_ok = all(sl <= slen + UNC_FEAS_TOL for sl in ssupport_lens)
+            sfeas = unc_within_threshold(sunc, cont_threshold) && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in scurvs) && support_len_ok
+            if mod(smooth_iter, 50) == 0
+                println("    Smooth iter $(lpad(smooth_iter,3)): len=$(round(slen,digits=2)), unc=$(round(sunc,digits=4))")
+            end
+            if sfeas; println("    → Feasible at smoothing iter $smooth_iter"); break; end
+        end
+        flat = smooth_flat
+        init_len, init_unc, init_wpts, init_covs, init_curvs, init_max_curv, init_ctrls, init_support_lens = eval_continuous(flat)
+        println("  After smoothing: prim_len=$(round(init_len,digits=3)), unc=$(round(init_unc,digits=4))")
+    else
+        println("  [Smoothing] Initial point is feasible; proceeding to barrier optimization")
+    end
+
+    # Barrier optimizer (simplified reuse of in-file logic but using cont_threshold)
+    adam_m = zeros(total_free_cont); adam_v = zeros(total_free_cont)
+    best_flat = copy(flat); best_len = init_len; best_unc = init_unc
+    best_feasible_flat = nothing; best_feasible_len = Inf; best_feasible_unc = Inf
+    prev_len = init_len
+
+    function spline_barrier_objective(flat::Vector{Float64}, barrier_mu::Float64)
+        prim_len, goal_unc, _, _, curvatures, _, _, support_lens = eval_continuous(flat)
+        unc_slack = cont_threshold - goal_unc
+        penalty = 0.0
+        if unc_slack <= 1e-9
+            penalty += 1e4 * (1e-9 - unc_slack)^2
+        else
+            penalty -= barrier_mu * log(unc_slack)
+        end
+        for curvset in curvatures
+            for κ in curvset
+                slack = MAX_CURVATURE - κ
                 if slack <= 1e-9
                     penalty += 1e4 * (1e-9 - slack)^2
                 else
                     penalty -= barrier_mu * log(slack)
                 end
             end
-            return prim_len + penalty
         end
-
-        local stage_iters = max(25, cld(CONT_OPT_ITERS, CONT_BARRIER_STAGES))
-        local barrier_mu = CONT_BARRIER_START
-        local total_iter = 0
-        local turn_txt = ""
-
-        for stage in 1:CONT_BARRIER_STAGES
-            println("  Barrier stage $(stage)/$(CONT_BARRIER_STAGES): μ=$(round(barrier_mu, digits=4))")
-            for iter in 1:stage_iters
-                total_iter += 1
-                obj0 = spline_barrier_objective(flat, barrier_mu)
-
-                # Finite-difference gradient of the barrier objective.
-                grad = zeros(total_free_cont)
-                for k in 1:total_free_cont
-                    flat[k] += CONT_OPT_H
-                    obj1 = spline_barrier_objective(flat, barrier_mu)
-                    grad[k] = (obj1 - obj0) / CONT_OPT_H
-                    flat[k] -= CONT_OPT_H
-                end
-
-                b1t = CONT_ADAM_B1^total_iter
-                b2t = CONT_ADAM_B2^total_iter
-                step = zeros(total_free_cont)
-                for k in 1:total_free_cont
-                    g = grad[k]
-                    adam_m[k] = CONT_ADAM_B1 * adam_m[k] + (1 - CONT_ADAM_B1) * g
-                    adam_v[k] = CONT_ADAM_B2 * adam_v[k] + (1 - CONT_ADAM_B2) * g^2
-                    m̂ = adam_m[k] / (1 - b1t)
-                    v̂ = adam_v[k] / (1 - b2t)
-                    step[k] = CONT_OPT_LR * m̂ / (sqrt(v̂) + CONT_ADAM_EPS)
-                end
-
-                trial = flat .- step
-                trial_obj = spline_barrier_objective(trial, barrier_mu)
-                backtracks = 0
-                while (!isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT) && backtracks < 12
-                    step .*= CONT_LINESEARCH_SHRINK
-                    trial = flat .- step
-                    trial_obj = spline_barrier_objective(trial, barrier_mu)
-                    backtracks += 1
-                end
-
-                if !isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT
-                    println("  [Spline barrier] line search stalled; stopping at stage $stage")
-                    break
-                end
-
-                flat .= trial
-
-                len2, unc2, wpts2, covs2, curv2, max_curv2, _, support_lens2 = eval_continuous(flat)
-                support_len_ok = all(sl <= len2 + UNC_FEAS_TOL for sl in support_lens2)
-                feasible = unc_within_threshold(unc2) &&
-                           all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in curv2) &&
-                           support_len_ok
-
-                push!(opt_iter_log, total_iter)
-                push!(opt_len_log, len2)
-                push!(opt_unc_log, unc2)
-                for a in 1:(num_agents - 1)
-                    push!(opt_support_len_logs[a], support_lens2[a])
-                    push!(opt_support_unc_logs[a], unc_radius(covs2[a][end]))
-                end
-
-                if mod(total_iter, 20) == 0
-                    status = feasible ? "✓" : "✗"
-                    turn_r = isempty(max_curv2) || maximum(max_curv2) < 1e-12 ? Inf : 1.0 / maximum(max_curv2)
-                    turn_txt = isfinite(turn_r) ? string(round(turn_r, digits=3)) : "Inf"
-                    println("  Iter $(lpad(total_iter,3))  len=$(round(len2,digits=3))  unc=$(round(unc2,digits=4))  turnR=$(turn_txt)  $status")
-                end
-
-                if feasible && len2 < best_feasible_len
-                    best_feasible_len = len2
-                    best_feasible_unc = unc2
-                    best_feasible_flat = copy(flat)
-                end
-
-                if len2 < best_len
-                    best_len = len2
-                    best_unc = unc2
-                    best_flat = copy(flat)
-                end
-
-                if feasible && abs(len2 - prev_len) < CONT_CONV_TOL
-                    println("  → Converged at iter $total_iter (Δlen=$(round(abs(len2-prev_len),digits=6)))")
-                    break
-                end
-                prev_len = len2
-            end
-
-            barrier_mu *= CONT_BARRIER_DECAY
-        end
-        
-        # Evaluate best solution: prefer best feasible iterate if one exists.
-        selected_flat = isnothing(best_feasible_flat) ? best_flat : best_feasible_flat
-        opt_len, opt_unc, opt_wpts, opt_covs, opt_curvs, opt_max_curv, opt_ctrls, opt_support_lens = eval_continuous(selected_flat)
-        opt_support_uncs = [unc_radius(opt_covs[a][end]) for a in 1:(num_agents - 1)]
-
-        # Append the selected solution as a final log sample so convergence traces
-        # end at the actual accepted output (not necessarily the last optimizer iterate).
-        selected_iter = isempty(opt_iter_log) ? 0 : (opt_iter_log[end] + 1)
-        push!(opt_iter_log, selected_iter)
-        push!(opt_len_log, opt_len)
-        push!(opt_unc_log, opt_unc)
-        for a in 1:(num_agents - 1)
-            push!(opt_support_len_logs[a], opt_support_lens[a])
-            push!(opt_support_unc_logs[a], opt_support_uncs[a])
-        end
-
-        opt_max_curv_peak = isempty(opt_max_curv) ? 0.0 : maximum(opt_max_curv)
-        opt_turn_r = opt_max_curv_peak < 1e-12 ? Inf : 1.0 / opt_max_curv_peak
-        curvature_ok = all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in opt_curvs)
-        support_len_ok_final = all(sl <= opt_len + UNC_FEAS_TOL for sl in opt_support_lens)
-        turn_txt = isfinite(opt_turn_r) ? round(opt_turn_r, digits=3) : Inf
-        println("  Final: prim_len=$(round(opt_len, digits=3)), unc=$(round(opt_unc, digits=4)), " *
-            "min_turn_radius=$(turn_txt), threshold=$(UNC_RADIUS_THRESHOLD)")
-        for a in 1:(num_agents - 1)
-            println("         support $a: len=$(round(opt_support_lens[a], digits=3)), unc=$(round(opt_support_uncs[a], digits=4))")
-        end
-        
-        if unc_within_threshold(opt_unc) && curvature_ok && support_len_ok_final
-            println("  ✓ Optimization successful — uncertainty constraint met")
-            
-            # Figure 2: optimized continuous paths
-            plt2 = make_base_plot(landmarks, graph)
-            for ai in 1:num_agents
-                wpts = opt_wpts[ai]
-                xs = [w[1] for w in wpts]
-                ys = [w[2] for w in wpts]
-                is_prim = is_primary_mask[ai]
-                clr = is_prim ? :blue : get(agent_colors, ai, :gray)
-                lbl = is_prim ? "Primary (path[$ai])" : "Support $ai (path[$ai])"
-                if !is_prim
-                    ys = ys .+ (SUPPORT_PLOT_OFFSET_M * ai)
-                    lbl *= " (offset)"
-                end
-                lw = is_prim ? 2.2 : 1.3
-                # Vary linestyle by support agent index: dash, dashdot, etc.
-                ls = is_prim ? :solid : (ai == 1 ? :dash : (ai == 2 ? :dashdot : :dot))
-                plot!(plt2, xs, ys, label=lbl, color=clr, linewidth=lw, linestyle=ls)
-                scatter!(plt2, xs, ys, label=false, color=clr, markersize=3, markerstrokewidth=0)
-            end
-            
-            # Primary uncertainty ellipses
-            prim_covs = opt_covs[end]
-            prim_wpts = opt_wpts[end]
-            prim_xs = [w[1] for w in prim_wpts]
-            prim_ys = [w[2] for w in prim_wpts]
-            
-            for k in 1:length(prim_covs)
-                draw_covariance_ellipse!(plt2, prim_xs[k], prim_ys[k], prim_covs[k];
-                                          nstd=2, color=:blue, alpha=0.10)
-            end
-            
-            title!(plt2,"Fig 2: Continuous [len=$(round(opt_len,digits=2)), unc=$(round(opt_unc,digits=3))]")
-            xlabel!(plt2,"x (m)"); ylabel!(plt2,"y (m)")
-            savefig(plt2,"fig2_continuous_opt.png"); println("Fig 2 saved.")
-            
-            # Figure 3: convergence plots (length and uncertainty)
-            # Left subplot: path length convergence
-            plt3a = plot(opt_iter_log, opt_len_log,
-                        label="Primary length", color=:blue, linewidth=2,
-                        xlabel="Iteration", ylabel="Path length (m)",
-                        legend=:topright)
-            for a in 1:(num_agents - 1)
-                support_clr = get(agent_colors, a, :gray)
-                plot!(plt3a, opt_iter_log, opt_support_len_logs[a],
-                     label="Support $a length", color=support_clr, linewidth=1.5, linestyle=:dash)
-                  hline!(plt3a, [opt_support_lens[a]], label="Support $a final ($(round(opt_support_lens[a],digits=2)))",
-                      color=support_clr, linestyle=:dot, linewidth=1.0, alpha=0.45)
-            end
-            hline!(plt3a, [init_len], label="Init ($(round(init_len,digits=2)))",
-                   color=:gray, linestyle=:dash, linewidth=1.0, alpha=0.5)
-            hline!(plt3a, [opt_len], label="Final ($(round(opt_len,digits=2)))",
-                   color=:red, linestyle=:dot, linewidth=1.0, alpha=0.5)
-            
-            # Right subplot: uncertainty convergence
-            plt3b = plot(opt_iter_log, opt_unc_log,
-                        label="Primary unc", color=:blue, linewidth=2,
-                        xlabel="Iteration", ylabel="Uncertainty (m)",
-                        legend=:topright)
-            for a in 1:(num_agents - 1)
-                support_clr = get(agent_colors, a, :gray)
-                plot!(plt3b, opt_iter_log, opt_support_unc_logs[a],
-                     label="Support $a unc", color=support_clr, linewidth=1.5, linestyle=:dash)
-                hline!(plt3b, [opt_support_uncs[a]], label="Support $a final ($(round(opt_support_uncs[a],digits=4)))",
-                       color=support_clr, linestyle=:dot, linewidth=1.0, alpha=0.45)
-            end
-            hline!(plt3b, [init_unc], label="Init ($(round(init_unc,digits=4)))",
-                   color=:gray, linestyle=:dash, linewidth=1.0, alpha=0.5)
-            hline!(plt3b, [opt_unc], label="Final ($(round(opt_unc,digits=4)))",
-                   color=:red, linestyle=:dot, linewidth=1.0, alpha=0.5)
-            hline!(plt3b, [UNC_RADIUS_THRESHOLD], label="Threshold",
-                   color=:green, linestyle=:solid, linewidth=1.0, alpha=0.3)
-            
-            plt3 = plot(plt3a, plt3b, layout=(1,2), size=(1400, 400),
-                       plot_title="Fig 3: Continuous Optimization Convergence")
-            savefig(plt3,"fig3_convergence.png"); println("Fig 3 saved.")
-        else
-            # Fallback: if continuous optimization is infeasible, optionally continue
-            # relaxed-threshold A* instead of stopping at this seed.
-            discrete_feasible_relaxed = unc_within_threshold(init_unc, disc_unc_threshold)
-            if CONTINUE_ASTAR_ON_INFEASIBLE && PIPELINE_MODE == :discrete_then_continuous
-                println("  ⚠ Continuous optimization infeasible; continuing A* under relaxed threshold for an alternate seed...")
-                next_support_paths, next_primary_path, next_primary_dist = run_discrete_seed_search(disc_unc_threshold)
-                if !isempty(next_primary_path)
-                    support_paths = next_support_paths
-                    primary_path = next_primary_path
-                    primary_dist = next_primary_dist
-                    paths = vcat(support_paths, [primary_path])
-                    final_global_cov, dists = evaluate_full_paths(paths, graph, landmarks, NUM_AGENTS)
-                    uncs = [unc_radius(final_global_cov[a]) for a in 1:NUM_AGENTS]
-                    println("  ✓ Alternate relaxed-feasible discrete seed found; using continued A* output (goal_unc=$(round(uncs[end],digits=4))).")
-                elseif discrete_feasible_relaxed
-                    println("  ⚠ No alternate relaxed seed found; keeping current relaxed-feasible seed: unc=$(round(init_unc,digits=4)) ≤ $(round(disc_unc_threshold,digits=4))")
-                else
-                    println("  ✗ No alternate relaxed seed found, and current seed is infeasible under relaxed threshold.")
-                end
-            elseif discrete_feasible_relaxed
-                println("  ⚠ Continuous optimization failed turn-radius constraint, but discrete solution is feasible")
-                println("  → Accepting discrete solution under relaxed threshold: unc=$(round(init_unc,digits=4)) ≤ $(round(disc_unc_threshold,digits=4))")
+        for sl in support_lens
+            slack = prim_len - sl
+            if slack <= 1e-9
+                penalty += 1e4 * (1e-9 - slack)^2
             else
-                println("  ✗ Optimization did not meet feasibility constraints (unc=$(round(opt_unc,digits=4)), Rmin=$(turn_txt))")
+                penalty -= barrier_mu * log(slack)
             end
         end
-    else
-        println("  (No intermediate waypoints to optimize)")
+        return prim_len + penalty
     end
+
+    stage_iters = max(25, cld(CONT_OPT_ITERS, CONT_BARRIER_STAGES))
+    barrier_mu = CONT_BARRIER_START; total_iter = 0
+    for stage in 1:CONT_BARRIER_STAGES
+        println("  Barrier stage $(stage)/$(CONT_BARRIER_STAGES): μ=$(round(barrier_mu,digits=4))")
+        for iter in 1:stage_iters
+            total_iter += 1
+            obj0 = spline_barrier_objective(flat, barrier_mu)
+            grad = zeros(total_free_cont)
+            for k in 1:total_free_cont
+                flat[k] += CONT_OPT_H; obj1 = spline_barrier_objective(flat, barrier_mu); grad[k] = (obj1 - obj0) / CONT_OPT_H; flat[k] -= CONT_OPT_H
+            end
+            b1t = CONT_ADAM_B1^total_iter; b2t = CONT_ADAM_B2^total_iter
+            step = zeros(total_free_cont)
+            for k in 1:total_free_cont
+                g = grad[k]
+                adam_m[k] = CONT_ADAM_B1 * adam_m[k] + (1 - CONT_ADAM_B1) * g
+                adam_v[k] = CONT_ADAM_B2 * adam_v[k] + (1 - CONT_ADAM_B2) * g^2
+                m̂ = adam_m[k] / (1 - b1t); v̂ = adam_v[k] / (1 - b2t)
+                step[k] = CONT_OPT_LR * m̂ / (sqrt(v̂) + CONT_ADAM_EPS)
+            end
+            trial = flat .- step; trial_obj = spline_barrier_objective(trial, barrier_mu); backtracks = 0
+            while (!isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT) && backtracks < 12
+                step .*= CONT_LINESEARCH_SHRINK; trial = flat .- step; trial_obj = spline_barrier_objective(trial, barrier_mu); backtracks += 1
+            end
+            if !isfinite(trial_obj) || trial_obj > obj0 - CONT_MIN_IMPROVEMENT
+                println("  [Spline barrier] line search stalled; stopping at stage $stage")
+                break
+            end
+            flat .= trial
+            len2, unc2, wpts2, covs2, curv2, max_curv2, _, support_lens2 = eval_continuous(flat)
+            support_len_ok = all(sl <= len2 + UNC_FEAS_TOL for sl in support_lens2)
+            feasible = unc_within_threshold(unc2, cont_threshold) && all(all(isfinite(κ) ? κ <= MAX_CURVATURE + 1e-9 : true for κ in curvset) for curvset in curv2) && support_len_ok
+            if feasible && len2 < best_feasible_len
+                best_feasible_len = len2; best_feasible_unc = unc2; best_feasible_flat = copy(flat)
+            end
+            if len2 < best_len
+                best_len = len2; best_unc = unc2; best_flat = copy(flat)
+            end
+            if feasible && abs(len2 - prev_len) < CONT_CONV_TOL
+                println("  → Converged at iter $total_iter (Δlen=$(round(abs(len2-prev_len),digits=6)))")
+                break
+            end
+            prev_len = len2
+        end
+        barrier_mu *= CONT_BARRIER_DECAY
+    end
+
+    selected_flat = isnothing(best_feasible_flat) ? best_flat : best_feasible_flat
+    opt_len, opt_unc, opt_wpts, opt_covs, opt_curvs, opt_max_curv, opt_ctrls, opt_support_lens = eval_continuous(selected_flat)
+    println("  Final: prim_len=$(round(opt_len,digits=3)), unc=$(round(opt_unc,digits=4)), threshold=$(round(cont_threshold,digits=4))")
+
+    # Evaluate initial discrete solution (waypoints from A* path)
+    init_len, init_unc, _, _, _, _, _, _ = eval_continuous(flat)
+
+    # Plot 1: Discrete solution (waypoints connected linearly)
+    plt1 = make_base_plot(landmarks, graph)
+    for ai in 1:num_agents
+        wpts = all_agent_wpts[ai]; xs = [w[1] for w in wpts]; ys = [w[2] for w in wpts]
+        is_prim = is_primary_mask[ai]; clr = is_prim ? :blue : get(agent_colors, ai, :gray)
+        if !is_prim; ys = ys .+ (SUPPORT_PLOT_OFFSET_M * ai); end
+        plot!(plt1, xs, ys, label=false, color=clr, linewidth=is_prim ? 2.2 : 1.3, linestyle=:dash)
+    end
+    annotate!(plt1, 950.0, 400.0, text("Discrete\nLen: $(round(init_len, digits=2))\nUnc: $(round(init_unc, digits=4))", 10, :left), annotationhalign=:left)
+    # (Do not save individual discrete figure; only save combined comparison)
+
+    # Plot 2: Continuous solution (fully optimized B-spline)
+    plt2 = make_base_plot(landmarks, graph)
+    for ai in 1:num_agents
+        wpts = opt_wpts[ai]; xs = [w[1] for w in wpts]; ys = [w[2] for w in wpts]
+        is_prim = is_primary_mask[ai]; clr = is_prim ? :blue : get(agent_colors, ai, :gray)
+        if !is_prim; ys = ys .+ (SUPPORT_PLOT_OFFSET_M * ai); end
+        plot!(plt2, xs, ys, label=false, color=clr, linewidth=is_prim ? 2.2 : 1.3)
+    end
+    annotate!(plt2, 950.0, 400.0, text("Continuous (Refined)\nLen: $(round(opt_len, digits=2))\nUnc: $(round(opt_unc, digits=4))", 10, :left), annotationhalign=:left)
+    # (Do not save individual continuous figure; only save combined comparison)
+    
+    # Combined side-by-side figure: discrete (left) vs continuous (right)
+    plt_comb = plot(plt1, plt2, layout=(1,2), size=(1200,500))
+    savefig(plt_comb, string(fig_prefix, "fig_compare_discrete_continuous", (fig_prefix == "" ? "" : "_"), string(round(opt_len,digits=2)), ".png"))
+    println("Fig combined (", fig_prefix, ") saved: Discrete Len=$(round(init_len,digits=2)) → Continuous Len=$(round(opt_len,digits=2))")
+    return opt_len, opt_unc, opt_wpts, opt_covs, opt_ctrls
+end
+
+if !isempty(paths) && all(length.(paths) .> 0)  # Continuous optimization only if all agents have paths
+    opt_len, opt_unc, opt_wpts, opt_covs, opt_ctrls = optimize_continuous(paths, graph, landmarks, NUM_AGENTS; cont_threshold=UNC_RADIUS_THRESHOLD, fig_prefix="main")
+    write_ctrls_csv("main_ctrls.csv", opt_ctrls)
+end
+
+# If Pareto seeds were collected earlier, run continuous optimizer for each now
+if length(PARETO_COLLECTED) > 0
+    println("\nRunning continuous refinement for $(length(PARETO_COLLECTED)) Pareto seeds...")
+    optimized_results = []
+    for (i, (ppaths, pdist, punc, it)) in enumerate(PARETO_COLLECTED)
+        println("  Refining Pareto seed $i (dist=$(round(pdist,digits=3)), unc=$(round(punc,digits=4)))")
+        support_paths = pad_support_paths_to_primary(ppaths[1:NUM_AGENTS-1], ppaths[NUM_AGENTS])
+        primary_path = ppaths[NUM_AGENTS]
+        all_paths = vcat(support_paths, [primary_path])
+        opt_len, opt_unc, opt_wpts, opt_covs, opt_ctrls = optimize_continuous(all_paths, graph, landmarks, NUM_AGENTS; cont_threshold=punc, fig_prefix="pareto_$(i)")
+        write_ctrls_csv("pareto_$(i)_ctrls.csv", opt_ctrls)
+        push!(optimized_results, (i, pdist, punc, opt_len, opt_unc, opt_wpts, opt_covs, opt_ctrls))
+    end
+
+    # Overlay optimized primary paths from Pareto seeds
+    plt_overlay = make_base_plot(landmarks, graph)
+    for (i, pdist, punc, opt_len, opt_unc, opt_wpts, opt_covs, opt_ctrls) in optimized_results
+        prim = opt_wpts[end]
+        xs = [w[1] for w in prim]; ys = [w[2] for w in prim]
+        plot!(plt_overlay, xs, ys, label="pareto_$i (len=$(round(opt_len,digits=2)), unc=$(round(opt_unc,digits=4)))")
+    end
+    savefig(plt_overlay, "fig_pareto_continuous_overlay.png"); println("Fig Pareto continuous overlay saved.")
 end
